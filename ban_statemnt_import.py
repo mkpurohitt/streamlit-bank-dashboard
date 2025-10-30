@@ -1710,6 +1710,240 @@ def parse_indusind_bank_format3(text: str) -> pd.DataFrame:
     df = df.dropna(subset=['Date'])
     return df
 
+# --- (NEW Parser: ICICI Bank - Format 2 - Money-Ending Logic) ---
+# --- (NEW Parser: ICICI Bank - Format 2 - Money-Ending Logic) ---
+def parse_icici_bank_format2(text: str) -> pd.DataFrame:
+    transactions = []
+    
+    # This pattern finds the three money amounts at the END of a line
+    money_pattern_end = re.compile(r"([\d,.-]+)\s+([\d,.-]+)\s+([\d,.]+)$")
+    
+    # This pattern finds the first date in a block
+    date_pattern = re.compile(r"(\d{2}/\d{2}/\d{4})")
+
+    # This helper function processes a single transaction block
+    def process_block(block_lines):
+        try:
+            if not block_lines:
+                return None
+            
+            # Join all lines in the block into one string
+            full_block = " ".join(block_lines).replace('\n', ' ').strip()
+            
+            # --- 1. Find Money at the end (we know it's here) ---
+            money_match = money_pattern_end.search(full_block)
+            if not money_match:
+                return None
+            
+            debit_str = money_match.group(1)
+            credit_str = money_match.group(2)
+            balance_str = money_match.group(3)
+            
+            # --- 2. Find the FIRST date in the block ---
+            date_match = date_pattern.search(full_block)
+            if not date_match:
+                return None # Not a transaction
+            
+            # We use the first date found (which is the Value Date)
+            date_str = date_match.group(1) 
+            
+            # --- 3. Extract Narration ---
+            # Narration is everything between the start and the money
+            narration_end_index = money_match.start()
+            narration_block = full_block[:narration_end_index].strip()
+            
+            # Remove the S.No, Value Date, and Txn Date from the start
+            # e.g., "5 03/04/2024 03/04/2024"
+            narration = re.sub(r"^\s*\d+\s+\d{2}/\d{2}/\d{4}\s+\d{2}/\d{2}/\d{4}\s*", "", narration_block).strip()
+            # Also remove just the S.No if it's on its own line
+            narration = re.sub(r"^\s*\d+\s+", "", narration).strip()
+                
+            return {
+                'Date': pd.to_datetime(date_str, format='%d/%m/%Y', errors='coerce'),
+                'Narration': narration,
+                'Withdrawal Amt.': debit_str,
+                'Deposit Amt.': credit_str,
+                'Closing Balance': balance_str
+            }
+        except Exception as e:
+            # print(f"Error in process_block: {e} | Block: {full_block}")
+            return None
+
+    # --- Main Loop (State Machine) ---
+    current_block_lines = []
+    data_started = False
+
+    for line in text.split('\n'):
+        line = line.strip()
+
+        # Skip lines until we find the header
+        if not data_started:
+            # The header is "S No. Value Date Transaction Date..."
+            # We must use re.search because of extra spaces
+            if re.search(r"S\s+No\.\s+Value\s+Date\s+Transaction\s+Date", line):
+                data_started = True
+            continue
+        
+        # We are after the header now
+        if not line or "--- PAGE BREAK ---" in line or "Transactions List - " in line or "DETAILED STATEMENT" in line:
+            continue
+            
+        # Add the line to our buffer
+        current_block_lines.append(line)
+        
+        # Check if this line is the END of a transaction
+        if money_pattern_end.search(line):
+            # We found the money, so this block is complete
+            parsed_txn = process_block(current_block_lines)
+            if parsed_txn:
+                transactions.append(parsed_txn)
+            
+            # Clear the buffer for the next transaction
+            current_block_lines = []
+
+    # After the loop, if there's anything left in the buffer,
+    # it's likely an incomplete fragment, so we ignore it.
+    
+    if not transactions:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(transactions)
+    
+    # 4. Clean the money columns
+    money_cols = ['Withdrawal Amt.', 'Deposit Amt.', 'Closing Balance']
+    for col in money_cols:
+        df[col] = df[col].astype(str).str.replace(',', '', regex=False).str.strip().replace('-', '0')
+        df[col] = df[col].replace('', '0')
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        
+    df = df.dropna(subset=['Date'])
+    return df
+
+
+# --- (NEW Parser: IndusInd Bank - Format 2 - v5 State Machine Logic) ---
+def parse_indusind_bank_format2(text: str) -> pd.DataFrame:
+    transactions = []
+    
+    # --- New Patterns ---
+    # Main line: Ref No, Date, Value Date/Time, Type, Narration Start
+    main_line_pattern = re.compile(
+        r"^(S\d+|'\d+)\s+(\d{2}\s\w{3}\s\d{4})\s+'(\d{2}-\w{3}-\d{2}\s\d{2}:\d{2}:\d{2})\s+(Debit|Credit)\s+(.*)$"
+    )
+    # Money line: Amount, Balance (and nothing else)
+    money_line_pattern = re.compile(r"^([\d,.-]+)\s+([\d,.]+)$")
+    # --- End New Patterns ---
+    
+    print("--- Starting IndusInd Bank (Format 2) v5 Parser ---")
+
+    current_date = None
+    current_type = None
+    narration_buffer = []
+    
+    lines = text.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+
+        # Skip empty lines, page breaks, and page numbers
+        if not line or \
+           line.startswith("--- PAGE BREAK ---") or \
+           line.startswith("Account Statement Customer Name") or \
+           re.fullmatch(r"\d+", line):
+            continue
+            
+        main_match = main_line_pattern.match(line)
+        money_match = money_line_pattern.match(line)
+        
+        if main_match:
+            # --- Found a Main Transaction Line ---
+            if narration_buffer and current_date: # Check if we have a pending transaction
+                try:
+                    last_line = narration_buffer.pop()
+                    money_match_prev = money_line_pattern.match(last_line)
+                    
+                    if money_match_prev:
+                        amount_str = money_match_prev.group(1).strip()
+                        balance_str = money_match_prev.group(2).strip()
+                        
+                        amount = float(amount_str.replace(',', ''))
+                        debit_amt = amount if current_type == 'DEBIT' else 0.0
+                        credit_amt = amount if current_type == 'CREDIT' else 0.0
+                        
+                        full_narration = " ".join(narration_buffer)
+                        full_narration = re.sub(r'\s+', ' ', full_narration).strip()
+                        
+                        transactions.append({
+                            'Date': pd.to_datetime(current_date, format='%d %b %Y', errors='coerce'),
+                            'Narration': full_narration,
+                            'Withdrawal Amt.': debit_amt,
+                            'Deposit Amt.': credit_amt,
+                            'Closing Balance': balance_str
+                        })
+                    
+                except Exception as e:
+                    pass # Discard this block
+
+            # --- Now, start the NEW transaction ---
+            current_date = main_match.group(2)
+            current_type = main_match.group(4).strip().upper()
+            narration_buffer = [main_match.group(5).strip()] # Add first part of narration
+            
+        elif money_match and not current_date:
+            narration_buffer.append(line)
+            
+        elif current_date:
+            narration_buffer.append(line)
+        
+        else:
+            pass
+
+    # --- Process the last transaction after the loop ---
+    if narration_buffer and current_date:
+        try:
+            last_line = narration_buffer.pop()
+            money_match_prev = money_line_pattern.match(last_line)
+            
+            if money_match_prev:
+                amount_str = money_match_prev.group(1).strip()
+                balance_str = money_match_prev.group(2).strip()
+                
+                amount = float(amount_str.replace(',', ''))
+                debit_amt = amount if current_type == 'DEBIT' else 0.0
+                credit_amt = amount if current_type == 'CREDIT' else 0.0
+                
+                full_narration = " ".join(narration_buffer)
+                full_narration = re.sub(r'\s+', ' ', full_narration).strip()
+                
+                transactions.append({
+                    'Date': pd.to_datetime(current_date, format='%d %b %Y', errors='coerce'),
+                    'Narration': full_narration,
+                    'Withdrawal Amt.': debit_amt,
+                    'Deposit Amt.': credit_amt,
+                    'Closing Balance': balance_str
+                })
+        except Exception as e:
+            pass
+
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+
+    print(f"--- Parser finished: Extracted {len(transactions)} transactions. ---")
+    df = pd.DataFrame(transactions)
+    
+    # Clean the money columns
+    money_cols = ['Withdrawal Amt.', 'Deposit Amt.', 'Closing Balance']
+    for col in money_cols:
+        df[col] = df[col].astype(str).str.replace(',', '', regex=False).str.strip().replace('-', '0')
+        df[col] = df[col].replace('', '0')
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        
+    df = df.dropna(subset=['Date'])
+    
+    # Reverse the DataFrame so transactions are in chronological order
+    df = df.iloc[::-1].reset_index(drop=True)
+    return df
+
 # --- (The Smart Router is unchanged) ---
 def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     """
@@ -1805,12 +2039,20 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     elif "FEDERAL BANK" in upper_filename or "FDRL" in upper_text:
         print("Bank identified as: Federal Bank. Using Federal parser.")
         return parse_federal_bank(text)
-    elif "ICICI BANK" in upper_filename or "DATEMODE**PARTICULARS" in clean_upper_text:
-        print("Bank identified as: ICICI Bank. Using ICICI parser.")
-        return parse_icici_bank(text)
-    
-   
-        
+        """elif "ICICI BANK" in upper_filename or "DATEMODE**PARTICULARS" in clean_upper_text:
+            print("Bank identified as: ICICI Bank. Using ICICI parser.")
+            return parse_icici_bank(text)
+            """
+    elif "ICICI BANK" in upper_filename or "ICIC" in upper_text:
+        print("Bank identified as: ICICI Bank.")
+
+        if "SNO.VALUEDATETRANSACTIONDATE" in clean_upper_text:
+            print(" -> Using ICICI Format 2 (Money-Ending) parser.")
+            # We assume you have added the function and named it parse_icici_bank_format2
+            return parse_icici_bank_format2(text)
+        else:
+            print(" -> Using ICICI Format 1 (DATEMODE) parser.")
+            return parse_icici_bank(text)
     elif "IDBI BANK FORMAT 2" in upper_filename or ("SRDATEDESCRIPTIONAMOUNT" in clean_upper_text and "IBKL" in upper_text):
         print("Bank identified as: IDBI Bank (Format 2). Using IDBI F2 parser.")
         return parse_idbi_bank_format2(text)
@@ -1838,14 +2080,55 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
                     print("Bank identified as: IndusInd Bank. Using IndusInd parser.")
                     return parse_indusind_bank(text)"""
         
+        """     elif "INDUSLAND" in upper_filename or "INDB" in clean_upper_text: # Using filename or IFSC
+                print("Bank identified as: IndusInd Bank.")
+
+                if "DATE TYPE DESCRIPTION DEBIT CREDIT BALANCE" in re.sub(r'\s+', ' ', upper_text):
+                    print(" -> Using IndusInd Format 3 (Block-Logic) parser.")
+                    return parse_indusind_bank_format3(text)
+
+                    # Check for Format 2's unique header
+                elif "BANKREFERENCE" in clean_upper_text or "PAYMENTNARRATION" in clean_upper_text:
+                    print(" -> Using IndusInd Format 2 (CSV-style) parser.")
+
+                    print(" -> Format 2 parser is known to be failing, skipping.")
+                    df_f1 = parse_indusind_bank(text) # Try F1 as a fallback
+                    if not df_f1.empty:
+                        print(" -> Format 2 failed, but Format 1 worked.")
+                        return df_f1
+                    else:
+                        return pd.DataFrame() # All failed
+                else:
+
+                    print(" -> Using IndusInd Format 1 (Original) parser.")
+                    return parse_indusind_bank(text) """
+
+    # ... (code for Saraswat bank or previous bank) ...
+    # ... (code for Indian Overseas Bank or previous bank) ...
+
     elif "INDUSLAND" in upper_filename or "INDB" in clean_upper_text: # Using filename or IFSC
         print("Bank identified as: IndusInd Bank.")
 
+        # --- Check 1: Format 3 (Your working check) ---
         if "DATE TYPE DESCRIPTION DEBIT CREDIT BALANCE" in re.sub(r'\s+', ' ', upper_text):
             print(" -> Using IndusInd Format 3 (Block-Logic) parser.")
-            return parse_indusind_bank_format3(text)
+            return parse_indusind_bank_format3(text) # Assumes you have this function
 
-            # Check for Format 2's unique header
+        # --- NEW Check 2: Format 2 (FINSENSE - the one we just built) ---
+        # We add this check *after* Format 3
+        elif "FINSENSESECURITIES" in clean_upper_text:
+            print(" -> Using IndusInd Format 2 (FINSENSE) parser.")
+            df_f2 = parse_indusind_bank_format2(text) # Call the new working parser
+            if not df_f2.empty:
+                print(" -> IndusInd Format 2 SUCCEEDED.")
+                return df_f2
+            else:
+                # Fallback to Format 1 if Format 2 fails
+                print(" -> Format 2 failed, trying Format 1 as fallback...")
+                return parse_indusind_bank(text)
+        # --- END NEW Check 2 ---
+
+        # --- Check 3: Your original Format 2 (CSV-style / BANKREFERENCE) ---
         elif "BANKREFERENCE" in clean_upper_text or "PAYMENTNARRATION" in clean_upper_text:
             print(" -> Using IndusInd Format 2 (CSV-style) parser.")
 
@@ -1856,10 +2139,12 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
                 return df_f1
             else:
                 return pd.DataFrame() # All failed
+        
+        # --- Fallback: Your original Format 1 ---
         else:
-
             print(" -> Using IndusInd Format 1 (Original) parser.")
-            return parse_indusind_bank(text)    
+            return parse_indusind_bank(text)
+
     elif "KOTAK" in upper_filename or "KKBK" in clean_upper_text:
         print("Bank identified as: Kotak Bank. Using Kotak parser (v1).")
         return parse_kotak_bank(text)
