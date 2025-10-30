@@ -4,6 +4,7 @@ import os
 import re
 import io
 
+
 def extract_text_from_pdf(filename: str, file_content: bytes) -> str:
     """
     Extracts text from PDF byte content.
@@ -765,15 +766,16 @@ def parse_kotak_bank(text: str) -> pd.DataFrame:
     df['Closing Balance'] = pd.to_numeric(df['Closing Balance'], errors='coerce').fillna(0)
 
     return df
-
-# --- (NEW Parser: SBI Bank) ---
-# --- (REFINED Parser: SBI Bank - v4 - Handles Multi-Statement PDFs) ---
+"""
+# --- (REFINED Parser: SBI Bank - v5 - Fixes Ref. Number Glitch) ---
 def parse_sbi_bank(text: str) -> pd.DataFrame:
     transactions = []
     # Transaction start pattern (d Mmm yyyy) - primary identifier
     date_pattern = re.compile(r"^(\d{1,2}\s\w{3}\s\d{4})")
-    # Money pattern: (Optional Debit)(Optional Credit)(Mandatory Balance) at end
-    money_pattern_end = re.compile(r"([\d,.-]*)\s+([\d,.-]*)\s+([\d,.]+)$")
+    
+    # --- FIX 1: This pattern now finds only the LAST TWO numbers (Amount, Balance) ---
+    money_pattern_end = re.compile(r"([\d,.-]+)\s+([\d,.]+)$")
+    
     # Pattern to check if a string looks like a number/amount
     number_like_pattern = re.compile(r"^-?[\d,.]+$")
     # Pattern to find the start marker reliably
@@ -787,59 +789,110 @@ def parse_sbi_bank(text: str) -> pd.DataFrame:
 
     lines = text.split('\n')
     current_transaction_lines = []
-    parsing_active = False # Flag to indicate if we are after the first valid header
+    parsing_active = False 
 
-    # --- Helper function (same as v3) ---
-    def process_block(block_lines):
-        # [This helper function remains unchanged from the previous version (v3)]
-        # [It takes a list of lines, finds date/narration/money, returns dict or None]
-        if not block_lines: return None
+    # --- FIX 2: Find the Opening Balance to track balance changes ---
+    last_balance = None
+    ob_match = re.search(r"Balance as on .*?: ([\d,.]+)", text, re.IGNORECASE)
+    if ob_match:
+        try:
+            last_balance = float(ob_match.group(1).replace(',', ''))
+            print(f"DEBUG SBI: Found Opening Balance: {last_balance}")
+        except ValueError:
+            pass # Failed to parse opening balance
+
+    # --- Helper function (HEAVILY MODIFIED) ---
+    def process_block(block_lines, prev_balance):
+        if not block_lines: 
+            return None, prev_balance # Return prev_balance
+            
         full_block = " ".join(block_lines)
         full_block = re.sub(r'\s{2,}', ' ', full_block).strip()
+        
         date_match = date_pattern.match(block_lines[0])
-        if not date_match: return None
+        if not date_match: 
+            return None, prev_balance
+            
         date_str = date_match.group(1)
 
+        # --- FIX 3: Use the new 2-number pattern ---
         money_match = money_pattern_end.search(full_block)
-        debit_str, credit_str, balance_str = "0", "0", "0"
+        amount_str, balance_str = "0", "0"
         money_start_index = -1
 
         if money_match:
-             raw_debit, raw_credit, balance_str_raw = money_match.groups()
-             if not number_like_pattern.match(balance_str_raw.replace(',', '')): return None
-             balance_str = balance_str_raw
-             debit_str = raw_debit.strip() if raw_debit.strip() and raw_debit.strip() != '-' else "0"
-             credit_str = raw_credit.strip() if raw_credit.strip() and raw_credit.strip() != '-' else "0"
-             money_start_index = money_match.start()
-
+            raw_amount, balance_str_raw = money_match.groups()
+            
+            # Check if balance is valid
+            if not number_like_pattern.match(balance_str_raw.replace(',', '')):
+                return None, prev_balance
+                
+            balance_str = balance_str_raw
+            amount_str = raw_amount.strip() if raw_amount.strip() and raw_amount.strip() != '-' else "0"
+            money_start_index = money_match.start()
+        
         if money_start_index != -1:
             try:
+                # Extract narration (everything up to the 2 money amounts)
                 value_date_match = re.search(r"\d{1,2}\s\w{3}\s\d{4}", full_block[date_match.end():])
                 narration_start_index = date_match.end()
                 if value_date_match:
-                     narration_start_index = date_match.end() + value_date_match.end()
-
+                    narration_start_index = date_match.end() + value_date_match.end()
+                
+                # --- FIX 4: Narration is now correct, includes ref numbers ---
                 narration = full_block[narration_start_index : money_start_index].strip()
                 narration = re.sub(r'\s+', ' ', narration).strip()
                 narration = re.sub(r"TRANSFER TO \d+$", "", narration).strip()
                 narration = re.sub(r"^TRANSFER TO ", "", narration).strip()
                 narration = narration.replace("Ref No./Cheque No.", "").strip()
-                narration = narration.replace("Debit Credit Balance", "").strip() # More header cleaning
+                narration = narration.replace("Debit Credit Balance", "").strip()
+
+                # --- FIX 5: Infer Withdrawal/Deposit using balance ---
+                withdrawal = 0.0
+                deposit = 0.0
+                
+                # Clean strings before converting to float
+                amount_cleaned = amount_str.replace(',', '')
+                balance_cleaned = balance_str.replace(',', '')
+                
+                amount = float(amount_cleaned) if amount_cleaned else 0.0
+                current_balance = float(balance_cleaned) if balance_cleaned else 0.0
+
+                if prev_balance is not None:
+                    # Use a small tolerance for floating point comparison
+                    if current_balance > prev_balance + 0.001:
+                        deposit = amount
+                    elif current_balance < prev_balance - 0.001:
+                        withdrawal = amount
+                    else: # Balance is same, amount is likely 0
+                        pass # Both are 0.0
+                else:
+                    # Fallback for first transaction if Opening Balance wasn't found
+                    narration_upper = narration.upper()
+                    if "BY TRANSFER" in narration_upper or "NEFT " in narration_upper or "CR " in narration_upper:
+                        deposit = amount
+                    else: # Default to withdrawal
+                        withdrawal = amount
 
                 return {
                     'Date': pd.to_datetime(date_str, format='%d %b %Y'),
                     'Narration': narration,
-                    'Withdrawal Amt.': debit_str,
-                    'Deposit Amt.': credit_str,
-                    'Closing Balance': balance_str
-                }
-            except Exception as e: return None
-        else: return None
+                    'Withdrawal Amt.': withdrawal,
+                    'Deposit Amt.': deposit,
+                    'Closing Balance': current_balance # Return as float
+                }, current_balance # Return the new balance
+
+            except Exception as e:
+                # print(f"SBI Process Block Error: {e}") # Debug
+                return None, prev_balance
+        else:
+            # print(f"SBI Money Pattern Failed: {full_block}") # Debug
+            return None, prev_balance
     # --- End helper function ---
 
-    # --- Main Loop ---
-    skipping_header_block = False # Flag to skip lines after a new header is detected
-    initial_start_found = False # Flag to find the very first statement start
+    # --- Main Loop (MODIFIED) ---
+    skipping_header_block = False 
+    initial_start_found = False 
 
     for i, line in enumerate(lines):
         line_stripped = line.strip()
@@ -847,96 +900,247 @@ def parse_sbi_bank(text: str) -> pd.DataFrame:
 
         # 1. Find the very first start indicator
         if not initial_start_found:
-             if start_indicator_pattern.search(line_single_space):
-                 initial_start_found = True
-                 # print(f"DEBUG: Initial 'Account Statement from' found near line {i}")
-             continue # Keep searching until the first indicator is passed
-
-        # Once initial start is found, start checking for data/headers/footers
+            if start_indicator_pattern.search(line_single_space):
+                initial_start_found = True
+            continue 
 
         # 2. Check for start of a NEW header block mid-file
-        #    Only check if we are *not* currently trying to skip a header
         if not skipping_header_block and any(p.match(line_single_space) for p in new_header_patterns):
-             # print(f"DEBUG: New header detected starting line {i}: '{line_single_space}'")
-             # Process any pending transaction block from the previous statement
-             parsed_transaction = process_block(current_transaction_lines)
-             if parsed_transaction:
-                 transactions.append(parsed_transaction)
-             
-             # Reset and start skipping this new header
-             current_transaction_lines = []
-             skipping_header_block = True
-             parsing_active = False # Deactivate parsing until next data line found
-             continue # Skip this header line
+            # Process any pending transaction block
+            # --- FIX 6: Capture new balance from helper ---
+            parsed_transaction, new_balance = process_block(current_transaction_lines, last_balance)
+            if parsed_transaction:
+                transactions.append(parsed_transaction)
+                last_balance = new_balance # Update last balance
+            
+            # Reset and start skipping
+            current_transaction_lines = []
+            skipping_header_block = True
+            parsing_active = False 
+            continue 
 
-        # 3. If skipping a header, look for the data start again
+        # 3. If skipping a header, look for data start
         if skipping_header_block:
-            # Look for the date pattern that indicates transactions are starting again
             if date_pattern.match(line_single_space):
-                 # print(f"DEBUG: Found first date after skipping header at line {i}: '{line_single_space}'")
-                 skipping_header_block = False # Stop skipping
-                 parsing_active = True        # Reactivate parsing
-                 current_transaction_lines = [line_stripped] # Start new block with this date line
-                 continue # Move to next line
+                skipping_header_block = False 
+                parsing_active = True     
+                current_transaction_lines = [line_stripped] 
+                continue 
             else:
-                 # print(f"DEBUG: Skipping header line {i}: '{line_single_space}'")
-                 continue # Continue skipping header lines
+                continue # Continue skipping
 
         # 4. If parsing is active, skip known footers/empty lines
         if parsing_active:
-            if line_stripped.startswith("Please") or \
-               line_stripped.startswith("Contd.") or \
-               line_stripped.startswith("Page ") or \
-               "State Bank of India" in line_stripped or \
-               "Txn Date Value" in line_stripped or \
-               "Date Description Ref No./Cheque" in line_stripped or \
-               "No. Debit Credit Balance" in line_stripped or \
-               not line_stripped:
-               # print(f"DEBUG: Skipping footer/header/empty line {i}: '{line_stripped}'")
-               continue
+            if (line_stripped.startswith("Please") or
+                line_stripped.startswith("Contd.") or
+                line_stripped.startswith("Page ") or
+                "State Bank of India" in line_stripped or
+                "Txn Date Value" in line_stripped or
+                "Date Description Ref No./Cheque" in line_stripped or
+                "No. Debit Credit Balance" in line_stripped or
+                not line_stripped):
+                continue
 
         # 5. If parsing is active and line is not a footer/header:
         if parsing_active:
             date_match = date_pattern.match(line_stripped)
             if date_match:
                 # Process the PREVIOUS accumulated block
-                parsed_transaction = process_block(current_transaction_lines)
+                # --- FIX 7: Capture new balance from helper ---
+                parsed_transaction, new_balance = process_block(current_transaction_lines, last_balance)
                 if parsed_transaction:
                     transactions.append(parsed_transaction)
+                    last_balance = new_balance # Update last balance
+                
                 # Start the NEW transaction block
                 current_transaction_lines = [line_stripped]
-            elif current_transaction_lines: # Only append if we've started a block
+            elif current_transaction_lines: 
                 # Append narration lines
                 current_transaction_lines.append(line_stripped)
 
-        # 6. If parsing is not yet active (after initial start, before first date)
-        #    Look for the first date to start the first block
+        # 6. If not parsing (after initial start, before first date)
         elif not parsing_active and initial_start_found:
-             date_match = date_pattern.match(line_stripped)
-             if date_match:
-                  # print(f"DEBUG: Found first transaction date at line {i}: '{line_stripped}'")
-                  parsing_active = True
-                  current_transaction_lines = [line_stripped] # Start first block
-             # else:
-                  # print(f"DEBUG: Skipping line before first date: '{line_stripped}'")
-                  
+            date_match = date_pattern.match(line_stripped)
+            if date_match:
+                parsing_active = True
+                current_transaction_lines = [line_stripped] # Start first block
+            
     # --- End Main Loop ---
 
-    # Process the very LAST transaction block after loop ends
-    parsed_transaction = process_block(current_transaction_lines)
+    # Process the very LAST transaction block
+    # --- FIX 8: Capture new balance from helper ---
+    parsed_transaction, new_balance = process_block(current_transaction_lines, last_balance)
     if parsed_transaction:
         transactions.append(parsed_transaction)
+        last_balance = new_balance # Update last balance
 
     if not transactions:
         return pd.DataFrame()
 
     df = pd.DataFrame(transactions)
+    # --- FIX 9: Clean money columns (most are floats, but good to be safe) ---
     money_cols = ['Withdrawal Amt.', 'Deposit Amt.', 'Closing Balance']
     for col in money_cols:
+        # Convert to string, clean, then convert to numeric
         df[col] = df[col].astype(str).str.strip().replace('-', '0', regex=False)
         df[col] = df[col].str.replace(',', '', regex=False)
         df[col] = df[col].replace('', '0')
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    return df
+"""
+# --- (REFINED Parser: SBI Bank - v8 - Merges v5 and v7 for Final Fix) ---
+def parse_sbi_bank(text: str) -> pd.DataFrame:
+    transactions = []
+    
+    # Pattern to find transaction dates (d Mmm yyyy)
+    date_pattern = re.compile(r"(\d{1,2}\s\w{3}\s\d{4})")
+    
+    # Pattern from v5: Finds the LAST TWO numbers (Amount, Balance) in a string
+    money_pattern_end = re.compile(r"([\d,.-]+)\s+([\d,.]+)$")
+    
+    # Pattern to check if a string looks like a number
+    number_like_pattern = re.compile(r"^-?[\d,.]+$")
+    
+    # --- 1. Find Opening Balance (from v5) ---
+    last_balance = None
+    ob_match = re.search(r"Balance as on .*?: ([\d,.]+)", text, re.IGNORECASE)
+    if ob_match:
+        try:
+            last_balance = float(ob_match.group(1).replace(',', ''))
+        except ValueError:
+            pass
+
+    # --- 2. Clean Text into One Giant Line (from v7) ---
+    
+    # Remove all page headers and footers
+    text = re.sub(r"--- PAGE \d+ ---", " ", text)
+    text = re.sub(r"^\s*Account Name.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Address.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Date.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Account Number.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Account Description.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Branch.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Drawing Power.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Interest Rate.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*MOD Balance.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*CIF No.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*CKYCR Number.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*IFS Code.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\(Indian Financial System\).*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*MICR Code.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\(Magnetic Ink Character Recognition\).*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Nomination Registered.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Balance as on.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Account Statement from.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Txn Date.*Balance.*$", "", text, flags=re.MULTILINE) # The main header
+    text = re.sub(r"^\s*Please check.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*State Bank of India.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Page \d+ of \d+.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Description.*$", "", text, flags=re.MULTILINE) # Header on new pages
+
+    # Replace all newlines with spaces to create one giant text block per page
+    text = text.replace('\n', ' ')
+    text = re.sub(r'\s+', ' ', text).strip() # Consolidate spaces
+
+    # --- 3. Split Text by Date and Process (NEW Logic) ---
+    
+    # Find all transaction dates. These are our split points.
+    date_matches = list(date_pattern.finditer(text))
+    
+    if not date_matches:
+        return pd.DataFrame() # No transactions found
+
+    for i in range(len(date_matches)):
+        current_date_match = date_matches[i]
+        date_str = current_date_match.group(1)
+        
+        # Define the start and end of this transaction's text block
+        start_index = current_date_match.start()
+        
+        end_index = None
+        if i + 1 < len(date_matches):
+            # If not the last match, end at the start of the next date
+            end_index = date_matches[i+1].start()
+        else:
+            # If it is the last match, go to the end of the text
+            end_index = len(text)
+            
+        # Get the full text for this single transaction
+        transaction_block = text[start_index:end_index].strip()
+        
+        # --- 4. Process Each Block (using v5's logic) ---
+        try:
+            # Find the LAST two numbers in this block
+            money_match = money_pattern_end.search(transaction_block)
+            
+            if not money_match:
+                continue # Skip if no money found
+
+            raw_amount, balance_str_raw = money_match.groups()
+            
+            # Check if balance is valid
+            if not number_like_pattern.match(balance_str_raw.replace(',', '')):
+                continue
+                
+            balance_str = balance_str_raw
+            amount_str = raw_amount.strip() if raw_amount.strip() and raw_amount.strip() != '-' else "0"
+            
+            # The narration is everything from the end of the first date
+            # to the start of the money match
+            narration_start_index = current_date_match.end() - start_index
+            narration_end_index = money_match.start()
+            
+            narration = transaction_block[narration_start_index:narration_end_index].strip()
+            
+            # Clean the narration (remove the Value Date)
+            narration = re.sub(r"^\d{1,2}\s\w{3}\s\d{4}\s*", "", narration).strip()
+            narration = narration.replace("Ref No./Cheque No.", "").strip()
+
+            # --- 5. Infer Deposit/Withdrawal (from v5) ---
+            withdrawal = 0.0
+            deposit = 0.0
+            
+            amount_cleaned = amount_str.replace(',', '')
+            balance_cleaned = balance_str.replace(',', '')
+            
+            amount = float(amount_cleaned) if amount_cleaned else 0.0
+            current_balance = float(balance_cleaned) if balance_cleaned else 0.0
+
+            if last_balance is not None:
+                if current_balance > last_balance + 0.001:
+                    deposit = amount
+                elif current_balance < last_balance - 0.001:
+                    withdrawal = amount
+                # else: balance is same
+            else:
+                # Fallback for first transaction
+                narration_upper = narration.upper()
+                if "BY TRANSFER" in narration_upper or "NEFT " in narration_upper or "CR " in narration_upper:
+                    deposit = amount
+                else: 
+                    withdrawal = amount
+
+            transactions.append({
+                'Date': pd.to_datetime(date_str, format='%d %b %Y'),
+                'Narration': narration,
+                'Withdrawal Amt.': withdrawal,
+                'Deposit Amt.': deposit,
+                'Closing Balance': current_balance
+            })
+            
+            last_balance = current_balance # Update for next loop
+
+        except Exception as e:
+            # print(f"Error processing block: {transaction_block} -> {e}")
+            continue
+
+    if not transactions:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(transactions)
+    df = df.dropna(subset=['Date'])
+    
     return df
 
 # --- (NEW Parser: UCO Bank) ---
