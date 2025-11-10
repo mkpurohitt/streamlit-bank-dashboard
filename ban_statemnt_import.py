@@ -2319,197 +2319,168 @@ def parse_punjab_national_bank_v1(text: str) -> pd.DataFrame:
 
 
 
-# --- (The Smart Router is unchanged) ---
 def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
+    """
+    Main router function. Extracts text and routes to the correct parser
+    based *only* on the filename.
+    """
     
-    
-    # 1. Extract text from bytes
-    # We pass both filename (for logging) and file_content
+    # 1. Extract text
     text = extract_text_from_pdf(filename, file_content)
-    
-    # 2. If text extraction failed (scanned, encrypted, etc.), return empty
     if not text:
         return pd.DataFrame()
     
-    # 3. Proceed with your existing, working router logic
-    # (This logic below is copied exactly from your provided code)
     print(f"--- Processing: {filename} ---")
     upper_filename = filename.upper()
+    
+    # We still need clean_upper_text for *internal* format checks (like for Axis/ICICI)
     upper_text = text[:1500].upper()
-    clean_upper_text = re.sub(r'\s+', '', upper_text) # Text without spaces
+    clean_upper_text = re.sub(r'\s+', '', upper_text)
 
-    # --- Bank Identification Logic (Order is important, most specific first) ---
-    if "CENTRAL BANK" in upper_filename or "CENTRALBANKOFINDIA" in clean_upper_text:
-        print("Bank identified as: Central Bank of India. Using CBI parser.")
-        return parse_central_bank_of_india(text)
-    
-    elif "UNION" in upper_filename or "UBIN" in clean_upper_text:
-        print("Bank identified as: UNION Bank. Using UNION parser.")
-        return parse_union_bank(text)
-    
-    elif "YES BANK" in upper_filename or "YESB" in clean_upper_text:
-        print("Bank identified as: YES Bank. Using YES parser.")
-        return parse_yes_bank(text)
-    
-    elif "PUNJAB NATIONAL BANK" in upper_filename or "PUNB" in upper_text:
-        print("Bank identified as: Punjab National Bank. Using PNB v1 parser.")
+    # ---
+    # NEW FILENAME-ONLY ROUTER
+    # This order is now much less important, but good to keep.
+    # ---
+
+    if "PUNJAB NATIONAL BANK" in upper_filename or "PNB" in upper_filename:
+        print("Bank identified by filename as: Punjab National Bank.")
         return parse_punjab_national_bank_v1(text)
-    
-    
-    
+
+    elif "YES BANK" in upper_filename:
+        print("Bank identified by filename as: YES Bank.")
+        return parse_yes_bank(text)
+        
+    elif "UNION" in upper_filename:
+        print("Bank identified by filename as: UNION Bank.")
+        return parse_union_bank(text)
+
+    elif "INDIAN BANK" in upper_filename:
+        print("Bank identified by filename as: Indian Bank.")
+        return parse_indian_bank_v6(text)
+        
+    elif "SBI" in upper_filename:
+        print("Bank identified by filename as: SBI.")
+        return parse_sbi_bank(text)
+
+    elif "DHANLAXMI" in upper_filename:
+        print("Bank identified by filename as: Dhanlaxmi Bank.")
+        return parse_dhanlaxmi_bank_v2(text)
+        
+    elif "SARASWAT" in upper_filename:
+        print("Bank identified by filename as: Saraswat Bank.")
+        return parse_saraswat_bank_v6(text)
+        
+    elif "IDBI" in upper_filename:
+        print("Bank identified by filename as: IDBI Bank.")
+        # Internal check for IDBI's two formats
+        if "BALANCE(INR)AMOUNT(INR)" in clean_upper_text:
+            print(" -> Using IDBI v4 parser.")
+            return parse_idbi_bank_v4(text)
+        else:
+            print(" -> Using IDBI F2 parser.")
+            return parse_idbi_bank_format2(text)
+        
+    elif "IDFCFIRST" in upper_filename:
+        print("Bank identified by filename as: IDFC First Bank.")
+        return parse_idfc_first_bank(text)
+
+    elif "INDIAN OVERSEAS" in upper_filename:
+        print("Bank identified by filename as: Indian Overseas Bank.")
+        return parse_indian_overseas_bank(text)
+
+    elif "INDUSIND" in upper_filename: # Corrected from INDUSLAND
+        print("Bank identified by filename as: IndusInd Bank.")
+        # Internal check for IndusInd's multiple formats
+        if "DATE TYPE DESCRIPTION DEBIT CREDIT BALANCE" in re.sub(r'\s+', ' ', upper_text):
+            print(" -> Using IndusInd Format 3.")
+            return parse_indusind_bank_format3(text)
+        elif "FINSENSESECURITIES" in clean_upper_text:
+            print(" -> Using IndusInd Format 2.")
+            return parse_indusind_bank_format2(text)
+        else:
+            print(" -> Using IndusInd Format 1.")
+            return parse_indusind_bank(text)
+
+    elif "KOTAK" in upper_filename:
+        print("Bank identified by filename as: Kotak Bank.")
+        return parse_kotak_bank(text)
+
+    elif "UCO" in upper_filename:
+        print("Bank identified by filename as: UCO Bank.")
+        return parse_uco_bank(text)
+        
+    elif "CENTRAL BANK" in upper_filename:
+        print("Bank identified by filename as: Central Bank of India.")
+        return parse_central_bank_of_india(text)
+        
+    elif "PUNJAB & SIND" in upper_filename:
+        print("Bank identified by filename as: Punjab & Sind Bank.")
+        return parse_punjab_sind_bank(text)
+
+    elif "CANARA" in upper_filename: # Simplified from CANARA BANK
+        print("Bank identified by filename as: Canara Bank.")
+        return parse_canara_bank(text)
+
+    elif "EQUITAS" in upper_filename:
+        print("Bank identified by filename as: Equitas.")
+        return parse_equitas_bank(text)
+
+    elif "FEDERAL BANK" in upper_filename:
+        print("Bank identified by filename as: Federal Bank.")
+        return parse_federal_bank(text)
+        
+    elif "AU" in upper_filename:
+        print("Bank identified by filename as: AU Small Finance Bank.")
+        return parse_au_bank(text)
+
+    elif "BANDHAN" in upper_filename:
+        print("Bank identified by filename as: Bandhan Bank.")
+        return parse_bandhan_bank(text)
+        
+    elif "BARODA" in upper_filename:
+        print("Bank identified by filename as: Bank of Baroda.")
+        # Internal check for Baroda's two formats
+        df = parse_bank_of_baroda(text) 
+        if not df.empty:
+            return df
+        print(" -> BoB Format 1 failed, trying Format 2...")
+        return parse_bank_of_baroda_format2(text) 
+        
+    elif "BANK OF INDIA" in upper_filename:
+        print("Bank identified by filename as: Bank of India.")
+        return parse_bank_of_india(text)
 
     elif "HDFC" in upper_filename:
-        print("Bank identified as: HDFC. Using HDFC parser.")
+        print("Bank identified by filename as: HDFC.")
         return parse_hdfc_bank(text)
+
     elif "AXIS" in upper_filename:
-        print("Bank identified as: Axis.")
+        print("Bank identified by filename as: Axis.")
+        # Internal check for Axis's two formats
         if "S.NOTRANSACTION" in clean_upper_text:
-            print("Using Axis Format 1 parser.")
+            print(" -> Using Axis Format 1.")
             return parse_axis_bank_format1(text)
         elif "TRANDATECHQNO" in clean_upper_text:
-            print("Using Axis Format 2 parser.")
+            print(" -> Using Axis Format 2.")
             return parse_axis_bank_format2(text)
-        else: # Fallback
+        else:
             df = parse_axis_bank_format1(text)
             if not df.empty: return df
             return parse_axis_bank_format2(text)
-    elif "AU" in upper_filename:
-        print("Bank identified as: AU Small Finance Bank. Using AU parser.")
-        return parse_au_bank(text)
-    elif "BANDHAN" in upper_filename:
-        print("Bank identified as: Bandhan Bank. Using Bandhan parser.")
-        return parse_bandhan_bank(text)
-    
-    elif "BARODA" in upper_filename:
-        # --- REMOVED the "SCANNED" filename check here ---
             
-        print("Bank identified as: Bank of Baroda.")
-        # Try the original parser first (Format 1)
-        print(" -> Trying BoB Format 1...")
-        df = parse_bank_of_baroda(text) # Assuming this is your original BoB parser
-        if not df.empty:
-            print(" -> BoB Format 1 SUCCEEDED.")
-            return df
-        
-        # If Format 1 failed, try the new parser (Format 2)
-        print(" -> BoB Format 1 failed, trying Format 2...")
-        # Make sure the function name below matches the one you added
-        df = parse_bank_of_baroda_format2(text) 
-        if not df.empty:
-            print(" -> BoB Format 2 SUCCEEDED.")
-            return df
-            
-        # If both failed
-        print(" -> Both BoB formats failed.")
-        return pd.DataFrame() # Return empty if neither worked
-    
-    elif ("BANK OF INDIA" in upper_filename and "CENTRAL" not in upper_filename) or "SRNODATEREMARKS" in clean_upper_text:
-        print("Bank identified as: Bank of India. Using BoI parser.")
-        if "CENTRALBANKOFINDIA" in clean_upper_text:
-            print(f"⚠️ False positive for BoI, skipping.")
-            return pd.DataFrame()
-        return parse_bank_of_india(text)
-    elif "PUNJAB & SIND" in upper_filename or "PSIB" in upper_text:
-        print("Bank identified as: Punjab & Sind Bank. Using P&S parser.")
-        return parse_punjab_sind_bank(text)
-    elif "CANARA BANK" in upper_filename or "CNRB" in upper_text:
-        print("Bank identified as: Canara Bank. Using Canara parser.")
-        return parse_canara_bank(text)
-    elif "EQUITAS" in upper_filename or "ESFB" in upper_text:
-        print("Bank identified as: Equitas Small Finance Bank. Using Equitas parser.")
-        return parse_equitas_bank(text)
-    elif "FEDERAL BANK" in upper_filename or "FDRL" in upper_text:
-        print("Bank identified as: Federal Bank. Using Federal parser.")
-        return parse_federal_bank(text)
-    
-    elif "DHANLAXMI" in upper_filename or "DLXB" in upper_text:
-         print("Bank identified as: Dhanlaxmi Bank. Using Dhanlaxmi parser.")
-         return parse_dhanlaxmi_bank_v2(text)
-    
-    elif "BALANCE(INR)AMOUNT(INR)" in clean_upper_text:
-        print("Bank identified as: IDBI Bank (v3/Encrypted). Using IDBI v4 parser.")
-        return parse_idbi_bank_v4(text)
-    
-    elif "IDBI BANK FORMAT 2" in upper_filename or ("SRDATEDESCRIPTIONAMOUNT" in clean_upper_text and "IBKL" in upper_text):
-        print("Bank identified as: IDBI Bank (Format 2). Using IDBI F2 parser.")
-        return parse_idbi_bank_format2(text)
-    
-
-    elif "IDFCFIRST" in upper_filename or ("TRANSACTIONDATEVALUEDATEPARTICULARS" in clean_upper_text and "IDFB" in upper_text):
-        print("Bank identified as: IDFC First Bank. Using IDFC parser.")
-        return parse_idfc_first_bank(text)
-    elif "INDIAN BANK" in upper_filename or "IDIB" in upper_text: # Using filename or IFSC
-        print("Bank identified as: Indian Bank. Using Indian Bank parser.")
-        return parse_indian_bank_v6(text)
-    elif "INDIAN OVERSEAS" in upper_filename or "IOBA" in clean_upper_text:
-        print("Bank identified as: Indian Overseas Bank. Using IOB parser.")
-        return parse_indian_overseas_bank(text)
-    
-    elif "INDUSLAND" in upper_filename or "INDB" in clean_upper_text: # Using filename or IFSC
-        print("Bank identified as: IndusInd Bank.")
-
-        # --- Check 1: Format 3 (Your working check) ---
-        if "DATE TYPE DESCRIPTION DEBIT CREDIT BALANCE" in re.sub(r'\s+', ' ', upper_text):
-            print(" -> Using IndusInd Format 3 (Block-Logic) parser.")
-            return parse_indusind_bank_format3(text) # Assumes you have this function
-
-        # --- NEW Check 2: Format 2 (FINSENSE - the one we just built) ---
-        # We add this check *after* Format 3
-        elif "FINSENSESECURITIES" in clean_upper_text:
-            print(" -> Using IndusInd Format 2 (FINSENSE) parser.")
-            df_f2 = parse_indusind_bank_format2(text) # Call the new working parser
-            if not df_f2.empty:
-                print(" -> IndusInd Format 2 SUCCEEDED.")
-                return df_f2
-            else:
-                # Fallback to Format 1 if Format 2 fails
-                print(" -> Format 2 failed, trying Format 1 as fallback...")
-                return parse_indusind_bank(text)
-        # --- END NEW Check 2 ---
-
-        # --- Check 3: Your original Format 2 (CSV-style / BANKREFERENCE) ---
-        elif "BANKREFERENCE" in clean_upper_text or "PAYMENTNARRATION" in clean_upper_text:
-            print(" -> Using IndusInd Format 2 (CSV-style) parser.")
-
-            print(" -> Format 2 parser is known to be failing, skipping.")
-            df_f1 = parse_indusind_bank(text) # Try F1 as a fallback
-            if not df_f1.empty:
-                print(" -> Format 2 failed, but Format 1 worked.")
-                return df_f1
-            else:
-                return pd.DataFrame() # All failed
-        
-        # --- Fallback: Your original Format 1 ---
-        else:
-            print(" -> Using IndusInd Format 1 (Original) parser.")
-            return parse_indusind_bank(text)
-
-    elif "KOTAK" in upper_filename or "KKBK" in clean_upper_text:
-        print("Bank identified as: Kotak Bank. Using Kotak parser (v1).")
-        return parse_kotak_bank(text)
-    elif "SBI" in upper_filename or "SBIN" in clean_upper_text:
-       print("Bank identified as: SBI. Using SBI parser.")
-       return parse_sbi_bank(text)
-    elif "UCO" in upper_filename or "UCBA" in clean_upper_text:
-        print("Bank identified as: UCO Bank. Using UCO parser.")
-        return parse_uco_bank(text)
-    elif "SARASWAT" in upper_filename or "SRCB" in upper_text:
-        print("Bank identified as: Saraswat Bank. Using Saraswat v6 parser.")
-        return parse_saraswat_bank_v6(text)
-    
-    
-    
-    elif "ICICI" in upper_filename or "ICIC" in upper_text:
-        print("Bank identified as: ICICI Bank.")
-
+    elif "ICICI" in upper_filename:
+        print("Bank identified by filename as: ICICI Bank.")
+        # Internal check for ICICI's two formats
         if "SNO.VALUEDATETRANSACTIONDATE" in clean_upper_text:
-            print(" -> Using ICICI Format 2 (Money-Ending) parser.")
-            # We assume you have added the function and named it parse_icici_bank_format2
+            print(" -> Using ICICI Format 2.")
             return parse_icici_bank_format2(text)
         else:
-            print(" -> Using ICICI Format 1 (DATEMODE) parser.")
+            print(" -> Using ICICI Format 1.")
             return parse_icici_bank(text)
-      
+            
+    # ---
+    # 4. FINAL FALLBACK
+    # ---
     else:
-        print(f"⚠️ No specific parser found for this bank. Skipping.")
+        print(f"⚠️ No parser found for filename: {filename}. Skipping.")
         return pd.DataFrame()
