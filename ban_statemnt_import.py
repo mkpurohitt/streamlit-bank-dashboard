@@ -2998,19 +2998,19 @@ def parse_central_bank_of_india_format3(text: str) -> pd.DataFrame:
 
 def parse_hdfc_bank_format2(text: str) -> pd.DataFrame:
     transactions = []
-    print("--- Starting HDFC Bank (Format 2) Parser ---")
+    print("--- Starting HDFC Bank (Format 2) Parser [FIXED] ---")
 
     # This pattern finds the *start* of a new transaction line
     date_start_pattern = re.compile(r"^(\d{2}/\d{2}/\d{2})")
     
-    # This pattern finds the Value Dt, Amount, and Balance
-    # G1: Value Dt, G2: Amount 1 (W/D), G3: Amount 2 (Balance or W/D), G4: Balance
-    # This handles both "ValDt Amount Balance" and "ValDt W D Balance"
-    money_pattern_end = re.compile(
-        r"(\d{2}/\d{2}/\d{2})\s+([\d,.]+)\s+(?:([\d,.]+)\s+)?([\d,.]+)$"
+    # --- THIS IS THE FIX ---
+    # We remove the '$' (end of line) anchor so the regex can
+    # find the money block even if text comes after it.
+    money_pattern_search = re.compile(
+        r"(\d{2}/\d{2}/\d{2})\s+([\d,.]+)\s+(?:([\d,.]+)\s+)?([\d,.]+)"
     )
+    # --- END OF FIX ---
 
-    # Find Opening Balance (if any)
     last_balance = None
     
     # --- Helper function to process a finished block ---
@@ -3022,7 +3022,8 @@ def parse_hdfc_bank_format2(text: str) -> pd.DataFrame:
         full_block = re.sub(r'\s+', ' ', full_block) # Consolidate spaces
         
         date_match = date_start_pattern.match(full_block)
-        money_match = money_pattern_end.search(full_block)
+        # We must use .search() to find the money block *anywhere*
+        money_match = money_pattern_search.search(full_block)
         
         if not date_match or not money_match:
             # print(f"Block skipped (no match): {full_block[:70]}...") # Debug
@@ -3032,28 +3033,32 @@ def parse_hdfc_bank_format2(text: str) -> pd.DataFrame:
             date_str = date_match.group(1)
             
             groups = money_match.groups()
+            
+            # --- UPDATED NARRATION/MONEY LOGIC ---
             if groups[2] is None:
                 # Format: ValDt Amount Balance
                 amount_str = groups[1]
                 balance_str = groups[3]
             else:
                 # Format: ValDt Withdrawal Deposit Balance
-                # We take the *first* non-zero amount
                 w_amt = float(groups[1].replace(',', '')) if groups[1] else 0.0
                 d_amt = float(groups[2].replace(',', '')) if groups[2] else 0.0
                 amount_str = str(w_amt or d_amt)
                 balance_str = groups[3]
-
-            # Narration is between the start date and the value date
+            
+            # 1. Narration is between the start date and the value date
             narration_start_index = date_match.end()
             narration_end_index = money_match.start(1) # Start of Value Dt
+            narration_part1 = full_block[narration_start_index:narration_end_index].strip()
             
-            if narration_start_index >= narration_end_index:
-                return None, prev_balance
+            # 2. Extra narration (spill-over) is *after* the money block
+            extra_narration_start = money_match.end(4) # End of the balance
+            narration_part2 = full_block[extra_narration_start:].strip()
 
-            narration = full_block[narration_start_index:narration_end_index].strip()
+            narration = f"{narration_part1} {narration_part2}".strip()
+            narration = re.sub(r'\s+', ' ', narration) # Clean up spaces
+            # --- END UPDATED LOGIC ---
             
-            # --- Balance Logic ---
             amount = float(amount_str.replace(',', ''))
             balance = float(balance_str.replace(',', ''))
             
@@ -3065,8 +3070,7 @@ def parse_hdfc_bank_format2(text: str) -> pd.DataFrame:
                 elif balance < prev_balance - 0.001:
                     withdrawal = amount
             else:
-                # Fallback guess
-                if "CR" in narration or "PAYOUT" in narration:
+                if "CR" in narration.upper() or "PAYOUT" in narration.upper() or "NEFT CR" in narration.upper():
                     deposit = amount
                 else:
                     withdrawal = amount
@@ -3085,7 +3089,7 @@ def parse_hdfc_bank_format2(text: str) -> pd.DataFrame:
             # print(f"Error processing block: {e} | Block: {full_block[:70]}...") # Debug
             return None, prev_balance
 
-    # --- State Machine ---
+    # --- State Machine (Unchanged) ---
     current_block_lines = []
     data_started = False
     
@@ -3108,20 +3112,17 @@ def parse_hdfc_bank_format2(text: str) -> pd.DataFrame:
                 parsed_txn, new_balance = process_block(current_block_lines, last_balance)
                 if parsed_txn:
                     transactions.append(parsed_txn)
-                    last_balance = new_balance # Update balance
+                    last_balance = new_balance
             
             current_block_lines = [line]
         
         elif current_block_lines:
-            # This is a continuation line
             current_block_lines.append(line)
     
-    # Process the last block
     if current_block_lines:
         parsed_txn, new_balance = process_block(current_block_lines, last_balance)
         if parsed_txn:
             transactions.append(parsed_txn)
-    # --- End of State Machine ---
         
     if not transactions:
         print("--- Parser finished: No transactions were extracted. ---")
@@ -4663,8 +4664,266 @@ def parse_union_bank_v3(text: str) -> pd.DataFrame:
     
     return df
 
+def parse_union_bank_format4(text: str) -> pd.DataFrame:
+    transactions = []
+    print("--- Starting Union Bank (Format 4) Parser ---")
 
+    # This pattern finds the *start* of a new transaction line
+    # G1: Date
+    date_start_pattern = re.compile(r"^\d+\s+(\d{2}-\d{2}-\d{4})")
+    
+    # This pattern finds the LAST TWO numbers on the line
+    # G1: Amount (debit or credit), G2: Balance (with " Cr")
+    money_pattern_end = re.compile(r"([\d,.]+)\s+([\d,.]+\s+Cr)$")
 
+    # Find Opening Balance
+    last_balance = None
+    ob_match = re.search(r"Opening\s+Balance\s+([\d,.]+)\s+Cr", text, re.IGNORECASE)
+    if ob_match:
+        try:
+            bal_str = ob_match.group(1).replace(',', '')
+            last_balance = float(bal_str)
+            print(f"Found Opening Balance: {last_balance}")
+        except Exception:
+            pass 
+    
+    # --- Helper function to process a finished block ---
+    def process_block(block_lines, prev_balance):
+        if not block_lines:
+            return None, prev_balance
+            
+        full_block = " ".join(block_lines).replace('\n', ' ').strip()
+        full_block = re.sub(r'\s+', ' ', full_block) # Consolidate spaces
+        
+        date_match = date_start_pattern.match(full_block)
+        money_match = money_pattern_end.search(full_block)
+        
+        if not date_match or not money_match:
+            return None, prev_balance
+            
+        try:
+            date_str = date_match.group(1)
+            amount_str = money_match.group(1)
+            balance_str = money_match.group(2).replace(' Cr', '').replace(',', '')
+            
+            # Narration is between the date and the money
+            narration_start_index = date_match.end()
+            narration_end_index = money_match.start()
+            
+            if narration_start_index >= narration_end_index:
+                return None, prev_balance
+
+            narration = full_block[narration_start_index:narration_end_index].strip()
+            
+            # --- Balance Logic ---
+            amount = float(amount_str.replace(',', ''))
+            balance = float(balance_str)
+            
+            withdrawal, deposit = 0.0, 0.0
+            
+            if prev_balance is not None:
+                if balance > prev_balance + 0.001:
+                    deposit = amount
+                elif balance < prev_balance - 0.001:
+                    withdrawal = amount
+            else:
+                # Fallback guess
+                if "CR/" in narration or "RTGS:" in narration:
+                    deposit = amount
+                else:
+                    withdrawal = amount
+            
+            txn_data = {
+                'Date': pd.to_datetime(date_str, format='%d-%m-%Y', errors='coerce'),
+                'Narration': narration.strip(),
+                'Withdrawal Amt.': withdrawal,
+                'Deposit Amt.': deposit,
+                'Closing Balance': balance
+            }
+            
+            return txn_data, balance # Return new balance
+            
+        except Exception as e:
+            return None, prev_balance
+
+    # --- State Machine ---
+    current_block_lines = []
+    data_started = False
+    
+    header_pattern = re.compile(r"SI\s+Date\s+Particulars\s+Chq\s+Num")
+    
+    for line in text.split('\n'):
+        line = line.strip()
+
+        if not data_started:
+            if header_pattern.search(line):
+                data_started = True
+                print("Header found, starting parser.")
+            continue
+        
+        if not line or "--- PAGE BREAK ---" in line or "Opening Balance" in line or header_pattern.search(line):
+            continue
+            
+        if date_start_pattern.match(line):
+            if current_block_lines:
+                parsed_txn, new_balance = process_block(current_block_lines, last_balance)
+                if parsed_txn:
+                    transactions.append(parsed_txn)
+                    last_balance = new_balance # Update balance
+            
+            current_block_lines = [line]
+        
+        elif current_block_lines:
+            # This is a continuation line
+            current_block_lines.append(line)
+    
+    # Process the last block
+    if current_block_lines:
+        parsed_txn, new_balance = process_block(current_block_lines, last_balance)
+        if parsed_txn:
+            transactions.append(parsed_txn)
+    # --- End State Machine ---
+        
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+
+    print(f"--- Parser finished: Extracted {len(transactions)} transactions. ---")
+    df = pd.DataFrame(transactions)
+    df = df.dropna(subset=['Date'])
+    return df
+def parse_yes_bank_format2(text: str) -> pd.DataFrame:
+    transactions = []
+    print("--- Starting YES Bank (Format 2) Parser ---")
+
+    # This pattern finds the *start* of a new transaction line
+    # G1: Transaction Date, G2: Value Date
+    date_start_pattern = re.compile(r"^(\d{2}-\w{3}-\d{4})\s+(\d{2}-\w{3}-\d{4})")
+    
+    # This pattern finds the LAST TWO numbers on the line
+    # G1: Amount (debit or credit), G2: Balance
+    # We look for two numbers at the end, ignoring the optional third.
+    money_pattern_end = re.compile(r"([\d,.]+)\s+([\d,.]+)$")
+
+    # Find Opening Balance (if any)
+    last_balance = None
+    
+    # --- Helper function to process a finished block ---
+    def process_block(block_lines, prev_balance):
+        if not block_lines:
+            return None, prev_balance
+            
+        full_block = " ".join(block_lines).replace('\n', ' ').strip()
+        full_block = re.sub(r'\s+', ' ', full_block) # Consolidate spaces
+        
+        date_match = date_start_pattern.match(full_block)
+        money_match = money_pattern_end.search(full_block)
+        
+        if not date_match or not money_match:
+            # print(f"Block skipped (no match): {full_block[:70]}...") # Debug
+            return None, prev_balance
+            
+        try:
+            date_str = date_match.group(1) # Transaction Date
+            amount_str = money_match.group(1) # This is either W/D or Deposit
+            balance_str = money_match.group(2) # This is the balance
+            
+            # Narration is everything between the date block and the money block
+            narration_start_index = date_match.end()
+            narration_end_index = money_match.start()
+            
+            if narration_start_index >= narration_end_index:
+                return None, prev_balance
+
+            narration_block = full_block[narration_start_index:narration_end_index].strip()
+            
+            # Clean the Cheq/Ref No. from the start of the narration block
+            narration = re.sub(r"^\S+\s+", "", narration_block).strip()
+
+            # --- Balance Logic ---
+            amount = float(amount_str.replace(',', ''))
+            balance = float(balance_str.replace(',', ''))
+            
+            withdrawal, deposit = 0.0, 0.0
+            
+            if prev_balance is not None:
+                if balance > prev_balance + 0.001:
+                    deposit = amount
+                elif balance < prev_balance - 0.001:
+                    withdrawal = amount
+            else:
+                # Fallback guess for first transaction
+                if "CR" in narration.upper() or "NEFT CR" in narration.upper():
+                    deposit = amount
+                else:
+                    withdrawal = amount
+            
+            txn_data = {
+                'Date': pd.to_datetime(date_str, format='%d-%b-%Y', errors='coerce'),
+                'Narration': narration.strip(),
+                'Withdrawal Amt.': withdrawal,
+                'Deposit Amt.': deposit,
+                'Closing Balance': balance
+            }
+            
+            return txn_data, balance # Return new balance
+            
+        except Exception as e:
+            # print(f"Error processing block: {e} | Block: {full_block[:70]}...") # Debug
+            return None, prev_balance
+
+    # --- State Machine ---
+    current_block_lines = []
+    data_started = False
+    
+    header_pattern = re.compile(r"Transaction Date\s+Value Date\s+Cheque No/ Reference No")
+    
+    for line in text.split('\n'):
+        line = line.strip()
+
+        if not data_started:
+            if header_pattern.search(line):
+                data_started = True
+                print("Header found, starting parser.")
+            continue
+        
+        # Skip junk lines
+        if not line or \
+           "--- PAGE BREAK ---" in line or \
+           header_pattern.search(line) or \
+           line.startswith("Page ") or \
+           line.startswith("Primary Holder:") or \
+           line.startswith("POOJA BIND"):
+            continue
+            
+        if date_start_pattern.match(line):
+            if current_block_lines:
+                parsed_txn, new_balance = process_block(current_block_lines, last_balance)
+                if parsed_txn:
+                    transactions.append(parsed_txn)
+                    last_balance = new_balance # Update balance
+            
+            current_block_lines = [line]
+        
+        elif current_block_lines:
+            # This is a continuation line
+            current_block_lines.append(line)
+    
+    # Process the last block
+    if current_block_lines:
+        parsed_txn, new_balance = process_block(current_block_lines, last_balance)
+        if parsed_txn:
+            transactions.append(parsed_txn)
+    # --- End State Machine ---
+        
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+
+    print(f"--- Parser finished: Extracted {len(transactions)} transactions. ---")
+    df = pd.DataFrame(transactions)
+    df = df.dropna(subset=['Date'])
+    return df
 
 def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     """
@@ -4704,13 +4963,29 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
 
     elif "YES BANK" in upper_filename:
         print("Bank identified by filename as: YES Bank.")
-        return parse_yes_bank(text)
+        
+        # --- NEW ROUTER LOGIC (FIXED) ---
+        # We check for Format 2's unique header "TRANSACTION DATE" first.
+        # We must use 'upper_text' (with spaces) because 'clean_upper_text'
+        # would merge "TRANSACTIONDATE" and "DATE".
+        
+        if "TRANSACTION DATE" in upper_text:
+            print(" -> Found 'TRANSACTION DATE'. Using YES Bank Format 2 (parse_yes_bank_format2).")
+            return parse_yes_bank_format2(text)
+        
+        # If it's not Format 2, it must be Format 1
+        else:
+            print(" -> 'TRANSACTION DATE' not found. Using YES Bank Format 1 (original parser).")
+            return parse_yes_bank(text)
         
     elif "UNION" in upper_filename:
         print("Bank identified by filename as: Union Bank.")
         
         # Internal check for Union Bank's three formats
         # We check for the most unique headers first
+        if "SIDATEPARTICULARSCHQNUM" in clean_upper_text:
+            print(" -> Using Union Bank Format 4 (v4 parser).")
+            return parse_union_bank_format4(text) # <-- The new parser
         
         if "DATEPARTICULARSCHQ.NO." in clean_upper_text:
             print(" -> Using Union Bank Format 3 (v3 parser).")
@@ -4945,15 +5220,19 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     elif "HDFC" in upper_filename:
         print("Bank identified by filename as: HDFC.")
         
-        # Internal check for HDFC's two formats
-        # We check for the new format's unique header
-        if "DATE NARRATION CHQ./REF.NO." in upper_text:
-            print(" -> Using HDFC Format 2 (v2 parser).")
-            return parse_hdfc_bank_format2(text)
+        if "CHQ./REF.NO.VALUEDT" in clean_upper_text:
+            print(" -> Found 'CHQ./REF.NO.VALUEDT'. Using HDFC Format 2 (parse_hdfc_bank_format2).")
+            return parse_hdfc_bank_format2(text) # <--- SWAPPED
+             
+           
+        elif "CHQ./REF.NO." in clean_upper_text:
+            print(" -> Found 'CHQ./REF.NO.' but not 'VALUEDT'. Using HDFC Format 1 (parse_hdfc_bank).")
+            return parse_hdfc_bank(text) # <--- SWAPPED
+             
         else:
-            # Fallback to original parser
-            print(" -> Using HDFC Format 1 (original parser).")
-            return parse_hdfc_bank(text)
+            
+            print(" -> No known HDFC header found, trying Format 2.")
+            return parse_hdfc_bank_format2(text)
 
     elif "AXIS" in upper_filename:
         print("Bank identified by filename as: Axis.")

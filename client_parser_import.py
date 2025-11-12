@@ -157,6 +157,44 @@ def parse_pl_format1(file_content: bytes) -> pd.DataFrame:
     except Exception as e:
         print(f"❌ Error in 'parse_pl_format1': {e}")
         return pd.DataFrame(columns=['Client Name'])
+    
+# --- NEW PARSER: Anand Rathi (HTML/.xls) ---
+def parse_anand_rathi_format2(file_content: bytes) -> pd.DataFrame:
+    """
+    Parses Anand Rathi "Format 2", which is an HTML table saved as .xls.
+    - Reads the file content as text.
+    - Uses pd.read_html() to find the table.
+    - Uses the first row (index 0) as the header.
+    - Extracts the 'Client Name' column.
+    """
+    try:
+        # Decode bytes to string
+        try:
+            file_text = file_content.decode('utf-8')
+        except UnicodeDecodeError:
+            file_text = file_content.decode('latin1') # Fallback
+
+        # Read the HTML table from the decoded text
+        # pd.read_html returns a LIST of DataFrames. We want the first one.
+        tables = pd.read_html(io.StringIO(file_text), header=0)
+        
+        if not tables:
+            print("⚠️ Parser 'anand_rathi_format2' ran but no tables were found in the file.")
+            return pd.DataFrame(columns=['Client Name'])
+        
+        df = tables[0]
+        
+        if 'Client Name' in df.columns:
+            names_df = df[['Client Name']].dropna().drop_duplicates()
+            # Column is already named 'Client Name', no rename needed
+            return names_df
+        else:
+            print("⚠️ Parser 'anand_rathi_format2' ran but 'Client Name' column was not found.")
+            return pd.DataFrame(columns=['Client Name'])
+            
+    except Exception as e:
+        print(f"❌ Error in 'parse_anand_rathi_format2': {e}")
+        return pd.DataFrame(columns=['Client Name'])
 
 # ==================================================================
 # --- The "Smart Router" for Client Lists ---
@@ -170,7 +208,11 @@ def parse_client_list(filename: str, file_content: bytes) -> pd.DataFrame:
 
     # --- Router Logic ---
     try:
-        if "ANAND RATHI" in upper_filename:
+
+        if "ANAND RATHI" in upper_filename and "FORMAT 2" in upper_filename:
+            print("  -> Using Anand Rathi (HTML/xls) parser.")
+            df = parse_anand_rathi_format2(file_content)
+        elif "ANAND RATHI" in upper_filename:
             print("   -> Using Anand Rathi (xlsx) parser.")
             df = parse_anand_rathi_format1(file_content)
         
