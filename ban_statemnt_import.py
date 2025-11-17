@@ -38,38 +38,93 @@ def extract_text_from_pdf(filename: str, file_content: bytes) -> str:
 # --- (All previous working parsers are unchanged) ---
 # HDFC, Axis 1&2, AU, Bandhan, BoB, BoI, P&S, Canara, CBI, Equitas, Federal, ICICI, IDBI F2, IDFC
 # (Code for previous parsers omitted for brevity - Copy the full script below)
-
 def parse_hdfc_bank(text: str) -> pd.DataFrame:
     transactions = []
+    print("--- Starting HDFC Bank (Format 1) Parser ---")
+    
+    # Debug: Print first 2000 characters to see what we're working with
+    print("DEBUG: First 2000 chars of text:")
+    print(text[:2000])
+    print("DEBUG: End of preview")
+    
+    # Pattern to match transaction lines
     pattern = re.compile(r"^(\d{2}/\d{2}/\d{2})\s+(.*?)\s+([\d,.]+)\s+([\d,.]+)($|\s)")
+    
     cleaned_lines = []
+    data_started = False
+    
+    # Look for the header to start processing
     for line in text.split('\n'):
         line = line.strip()
+        
+        # Check if we found the header
+        if not data_started:
+            if "Date" in line and "Narration" in line and "Chq" in line:
+                print(f"DEBUG: Found header line: {line}")
+                data_started = True
+            continue
+        
+        # Now process transaction lines
         if not re.match(r"^\d{2}/\d{2}/\d{2}", line) and cleaned_lines:
             if "--- PAGE BREAK ---" not in line and "Page No .:" not in line and "Statement Summary" not in line:
                  cleaned_lines[-1] += " " + line
         else:
-            cleaned_lines.append(line)
+            if re.match(r"^\d{2}/\d{2}/\d{2}", line):
+                cleaned_lines.append(line)
+    
+    print(f"DEBUG: Total cleaned lines to process: {len(cleaned_lines)}")
+    if cleaned_lines:
+        print(f"DEBUG: First cleaned line: {cleaned_lines[0]}")
+    
     last_balance = None
-    for line in cleaned_lines:
-        if "--- PAGE BREAK ---" in line or "Date Narration Chq./Ref.No." in line: continue
+    
+    for idx, line in enumerate(cleaned_lines):
+        if "--- PAGE BREAK ---" in line or "Date Narration Chq./Ref.No." in line: 
+            continue
+        
         match = pattern.search(line)
-        if not match: continue
+        if not match:
+            if idx < 3:  # Print first 3 non-matching lines for debugging
+                print(f"DEBUG: Line {idx} did not match pattern: {line[:100]}")
+            continue
+        
         try:
             date_str, narration, amount_str, balance_str = match.groups()[:4]
             balance = float(balance_str.replace(',', ''))
             amount = float(amount_str.replace(',', ''))
-            withdrawal, deposit = (0.0, 0.0)
+            
+            withdrawal, deposit = 0.0, 0.0
+            
             if last_balance is not None:
-                if balance > last_balance + 0.001: deposit = amount
-                else: withdrawal = amount
+                if balance > last_balance + 0.001: 
+                    deposit = amount
+                else: 
+                    withdrawal = amount
             else:
-                if "cr" in narration.lower() or "credit" in narration.lower(): deposit = amount
-                else: withdrawal = amount
-            transactions.append({'Date': pd.to_datetime(date_str, format='%d/%m/%y', errors='coerce'), 'Narration': narration.strip(), 'Withdrawal Amt.': withdrawal, 'Deposit Amt.': deposit, 'Closing Balance': balance})
+                if "cr" in narration.lower() or "credit" in narration.lower(): 
+                    deposit = amount
+                else: 
+                    withdrawal = amount
+            
+            transactions.append({
+                'Date': pd.to_datetime(date_str, format='%d/%m/%y', errors='coerce'), 
+                'Narration': narration.strip(), 
+                'Withdrawal Amt.': withdrawal, 
+                'Deposit Amt.': deposit, 
+                'Closing Balance': balance
+            })
+            
             last_balance = balance
-        except (ValueError, IndexError): continue
-    if not transactions: return pd.DataFrame()
+            
+        except (ValueError, IndexError) as e:
+            print(f"DEBUG: Error processing line: {e}")
+            continue
+    
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+    
+    print(f"--- Parser finished: Extracted {len(transactions)} transactions. ---")
     return pd.DataFrame(transactions)
 
 def parse_axis_bank_format1(text: str) -> pd.DataFrame:
@@ -5070,6 +5125,29 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     elif "INDIAN OVERSEAS" in upper_filename:
         print("Bank identified by filename as: Indian Overseas Bank.")
         return parse_indian_overseas_bank(text)
+    
+    elif "HDFC" in upper_filename:
+        print("Bank identified by filename as: HDFC.")
+        print(f"DEBUG: First 1000 chars of upper_text: {upper_text[:1000]}")
+        print(f"DEBUG: First 500 chars of clean_upper_text: {clean_upper_text[:500]}")
+        
+        # Check for Format 1 indicators
+        has_value_dt = "VALUE" in upper_text and "DT" in upper_text
+        has_chq_ref = "CHQ" in upper_text or "REF" in upper_text
+        
+        print(f"DEBUG: has_value_dt={has_value_dt}, has_chq_ref={has_chq_ref}")
+        
+        if has_value_dt and has_chq_ref:
+            print(" -> Using HDFC Format 1 (parse_hdfc_bank).")
+            return parse_hdfc_bank(text)
+        
+        elif "CHQ./REF.NO.VALUEDT" in clean_upper_text:
+            print(" -> Using HDFC Format 2 (parse_hdfc_bank_format2).")
+            return parse_hdfc_bank_format2(text)
+            
+        else:
+            print(" -> No specific HDFC header found, trying Format 1 as default.")
+            return parse_hdfc_bank(text)
 
     elif "INDUSIND" in upper_filename or "INDB" in clean_upper_text: # Corrected from INDUSLAND
         print("Bank identified by filename as: IndusInd Bank.")
@@ -5217,22 +5295,7 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
         print("Bank identified by filename as: Bank of India.")
         return parse_bank_of_india(text)
 
-    elif "HDFC" in upper_filename:
-        print("Bank identified by filename as: HDFC.")
-        
-        if "CHQ./REF.NO.VALUEDT" in clean_upper_text:
-            print(" -> Found 'CHQ./REF.NO.VALUEDT'. Using HDFC Format 2 (parse_hdfc_bank_format2).")
-            return parse_hdfc_bank_format2(text) # <--- SWAPPED
-             
-           
-        elif "CHQ./REF.NO." in clean_upper_text:
-            print(" -> Found 'CHQ./REF.NO.' but not 'VALUEDT'. Using HDFC Format 1 (parse_hdfc_bank).")
-            return parse_hdfc_bank(text) # <--- SWAPPED
-             
-        else:
-            
-            print(" -> No known HDFC header found, trying Format 2.")
-            return parse_hdfc_bank_format2(text)
+    
 
     elif "AXIS" in upper_filename:
         print("Bank identified by filename as: Axis.")
