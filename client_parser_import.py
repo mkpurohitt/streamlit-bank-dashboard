@@ -124,39 +124,99 @@ def parse_motilal_format1(file_content: bytes) -> pd.DataFrame:
     return names_df
 
 # --- Parser 5: PL (xlsx) ---
+# --- Parser 5: PL (xlsx) - UPDATED v2 ---
 def parse_pl_format1(file_content: bytes) -> pd.DataFrame:
-  
+    """
+    Parses PL Client List Excel files.
+    - Tries to find the correct sheet (tries multiple possible names)
+    - Handles multi-row headers
+    - Extracts from 'CLIENT NAME' and/or 'LD-CLIENT NAME' columns
+    """
     try:
-        df = pd.read_excel(io.BytesIO(file_content), sheet_name='18082025 DETAILS', header=0)
+        # First, try to read all sheet names
+        xls = pd.ExcelFile(io.BytesIO(file_content))
+        sheet_names = xls.sheet_names
+        
+        print(f"   DEBUG: Found sheets: {sheet_names}")
+        
+        # Try different possible sheet names
+        target_sheet = None
+        for sheet in sheet_names:
+            if 'DETAILS' in sheet.upper() or 'CLIENT' in sheet.upper():
+                target_sheet = sheet
+                break
+        
+        # If no matching sheet found, use the first sheet
+        if target_sheet is None:
+            target_sheet = sheet_names[0]
+            print(f"   DEBUG: No 'DETAILS' sheet found, using first sheet: {target_sheet}")
+        else:
+            print(f"   DEBUG: Using sheet: {target_sheet}")
+        
+        # Read the Excel file WITHOUT treating any row as header
+        df = pd.read_excel(io.BytesIO(file_content), sheet_name=target_sheet, header=None)
+        
+        print(f"   DEBUG: Excel shape: {df.shape}")
+        print(f"   DEBUG: First 5 rows:\n{df.head()}")
+        
+        # Search for 'CLIENT NAME' columns in the first 10 rows
+        client_name_col_indices = []
+        header_row_index = None
+        
+        for row_idx in range(min(10, len(df))):
+            row_values = df.iloc[row_idx].astype(str).str.upper()
+            for col_idx, value in enumerate(row_values):
+                if 'CLIENT NAME' in value:
+                    if header_row_index is None:
+                        header_row_index = row_idx
+                    client_name_col_indices.append((col_idx, value))
+                    print(f"   DEBUG: Found '{value}' at row {row_idx}, column {col_idx}")
+            
+            if client_name_col_indices:
+                break  # Stop after finding the header row
+        
+        if not client_name_col_indices:
+            print("⚠️ Could not find 'CLIENT NAME' column in the first 10 rows.")
+            return pd.DataFrame(columns=['Client Name'])
+        
+        # Extract data starting from the row AFTER the header
+        data_start_row = header_row_index + 1
         
         all_names_dfs = []
         
-        # Extract from the first potential name column
-        if 'CLIENT NAME' in df.columns:
-            df1 = df[['CLIENT NAME']].dropna().rename(columns={'CLIENT NAME': 'Client Name'})
-            all_names_dfs.append(df1)
-        else:
-            print("⚠️ Parser 'pl_format1' did not find 'CLIENT NAME' column.")
-
-        # Extract from the second potential name column
-        if 'LD-CLIENT NAME' in df.columns:
-            df2 = df[['LD-CLIENT NAME']].dropna().rename(columns={'LD-CLIENT NAME': 'Client Name'})
-            all_names_dfs.append(df2)
-        else:
-            print("⚠️ Parser 'pl_format1' did not find 'LD-CLIENT NAME' column.")
+        # Extract from each CLIENT NAME column found
+        for col_idx, col_name in client_name_col_indices:
+            client_names = df.iloc[data_start_row:, col_idx].dropna()
+            names_df_temp = pd.DataFrame(client_names.values, columns=['Client Name'])
+            all_names_dfs.append(names_df_temp)
         
         if not all_names_dfs:
-            print(f"❌ Parser 'pl_format1' found no client name columns.")
+            print(f"❌ Parser 'pl_format1' found no client names.")
             return pd.DataFrame(columns=['Client Name'])
-            
-        # Combine all found names, drop duplicates
+        
+        # Combine all found names
         combined_df = pd.concat(all_names_dfs, ignore_index=True)
+        
+        # Clean the data
+        combined_df['Client Name'] = combined_df['Client Name'].astype(str).str.strip()
+        
+        # Remove any leftover header text
+        combined_df = combined_df[~combined_df['Client Name'].str.upper().str.contains('CLIENT NAME|CODE|EMAIL|LLD', na=False)]
+        
+        # Remove empty strings
+        combined_df = combined_df[combined_df['Client Name'] != '']
+        
         names_df = combined_df.drop_duplicates()
+        
         return names_df
                 
     except Exception as e:
         print(f"❌ Error in 'parse_pl_format1': {e}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame(columns=['Client Name'])
+
+
     
 # --- NEW PARSER: Anand Rathi (HTML/.xls) ---
 def parse_anand_rathi_format2(file_content: bytes) -> pd.DataFrame:
