@@ -42,83 +42,36 @@ def parse_hdfc_bank(text: str) -> pd.DataFrame:
     transactions = []
     print("--- Starting HDFC Bank (Format 1) Parser ---")
     
-    # Debug: Print first 2000 characters to see what we're working with
-    print("DEBUG: First 2000 chars of text:")
-    print(text[:2000])
-    print("DEBUG: End of preview")
-    
-    # Pattern to match transaction lines
-    pattern = re.compile(r"^(\d{2}/\d{2}/\d{2})\s+(.*?)\s+([\d,.]+)\s+([\d,.]+)($|\s)")
-    
-    cleaned_lines = []
+    lines = text.split('\n')
     data_started = False
+    i = 0
     
-    # Look for the header to start processing
-    for line in text.split('\n'):
-        line = line.strip()
+    while i < len(lines):
+        line = lines[i].strip()
         
-        # Check if we found the header
+        # Find the header
         if not data_started:
-            if "Date" in line and "Narration" in line and "Chq" in line:
-                print(f"DEBUG: Found header line: {line}")
+            if "Date" in line and "Narration" in line and "Withdrawal" in line:
+                print(f"DEBUG: Found header at line {i}")
                 data_started = True
+                i += 1
+                continue
+            i += 1
             continue
         
-        # Now process transaction lines
-        if not re.match(r"^\d{2}/\d{2}/\d{2}", line) and cleaned_lines:
-            if "--- PAGE BREAK ---" not in line and "Page No .:" not in line and "Statement Summary" not in line:
-                 cleaned_lines[-1] += " " + line
-        else:
-            if re.match(r"^\d{2}/\d{2}/\d{2}", line):
-                cleaned_lines.append(line)
-    
-    print(f"DEBUG: Total cleaned lines to process: {len(cleaned_lines)}")
-    if cleaned_lines:
-        print(f"DEBUG: First cleaned line: {cleaned_lines[0]}")
-    
-    last_balance = None
-    
-    for idx, line in enumerate(cleaned_lines):
-        if "--- PAGE BREAK ---" in line or "Date Narration Chq./Ref.No." in line: 
+        # Skip empty lines and footers
+        if not line or "HDFC BANK LIMITED" in line or "Page No" in line or "Statement of account" in line:
+            i += 1
             continue
         
-        match = pattern.search(line)
-        if not match:
-            if idx < 3:  # Print first 3 non-matching lines for debugging
-                print(f"DEBUG: Line {idx} did not match pattern: {line[:100]}")
-            continue
+        # Check if line starts with a date
+        if re.match(r'^\d{2}/\d{2}/\d{2}\s', line):
+            # This is a transaction line
+            parsed = parse_hdfc_single_transaction(line)
+            if parsed:
+                transactions.append(parsed)
         
-        try:
-            date_str, narration, amount_str, balance_str = match.groups()[:4]
-            balance = float(balance_str.replace(',', ''))
-            amount = float(amount_str.replace(',', ''))
-            
-            withdrawal, deposit = 0.0, 0.0
-            
-            if last_balance is not None:
-                if balance > last_balance + 0.001: 
-                    deposit = amount
-                else: 
-                    withdrawal = amount
-            else:
-                if "cr" in narration.lower() or "credit" in narration.lower(): 
-                    deposit = amount
-                else: 
-                    withdrawal = amount
-            
-            transactions.append({
-                'Date': pd.to_datetime(date_str, format='%d/%m/%y', errors='coerce'), 
-                'Narration': narration.strip(), 
-                'Withdrawal Amt.': withdrawal, 
-                'Deposit Amt.': deposit, 
-                'Closing Balance': balance
-            })
-            
-            last_balance = balance
-            
-        except (ValueError, IndexError) as e:
-            print(f"DEBUG: Error processing line: {e}")
-            continue
+        i += 1
     
     if not transactions:
         print("--- Parser finished: No transactions were extracted. ---")
@@ -126,6 +79,87 @@ def parse_hdfc_bank(text: str) -> pd.DataFrame:
     
     print(f"--- Parser finished: Extracted {len(transactions)} transactions. ---")
     return pd.DataFrame(transactions)
+
+def parse_hdfc_single_transaction(line: str):
+    """
+    Parses a single HDFC transaction line - DEBUG VERSION
+    """
+    try:
+        # Extract the transaction date
+        date_match = re.match(r'^(\d{2}/\d{2}/\d{2})', line)
+        if not date_match:
+            return None
+        date_str = date_match.group(1)
+        
+        # Find all dates in the line
+        value_date_pattern = re.compile(r'\b(\d{2}/\d{2}/\d{2})\b')
+        all_dates = list(value_date_pattern.finditer(line))
+        
+        if len(all_dates) < 2:
+            return None
+        
+        # The last date is the value date
+        value_date_match = all_dates[-1]
+        value_date_end = value_date_match.end()
+        
+        # Get the section after value date (amounts only)
+        amounts_section = line[value_date_end:].strip()
+        
+        # DEBUG: Print what we're working with
+        narration_section = line[len(date_str):value_date_match.start()].strip()
+        print(f"\nDEBUG Line: {line[:80]}...")
+        print(f"  Narration section: {narration_section[:50]}...")
+        print(f"  Amounts section: {amounts_section}")
+        
+        # Extract numbers from amounts section only
+        number_pattern = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2})')
+        amounts = number_pattern.findall(amounts_section)
+        
+        print(f"  Found amounts: {amounts}")
+        
+        if len(amounts) < 2:
+            print(f"  SKIP: Not enough amounts")
+            return None
+        
+        # Parse amounts
+        if len(amounts) == 3:
+            withdrawal = float(amounts[0].replace(',', ''))
+            deposit = float(amounts[1].replace(',', ''))
+            balance = float(amounts[2].replace(',', ''))
+        elif len(amounts) == 2:
+            amount = float(amounts[0].replace(',', ''))
+            balance = float(amounts[1].replace(',', ''))
+            
+            # Check narration for credit keywords
+            if any(kw in narration_section.upper() for kw in ['CR', 'CREDIT', 'DEPOSIT', 'TRANSFER CR']):
+                withdrawal = 0.0
+                deposit = amount
+            else:
+                withdrawal = amount
+                deposit = 0.0
+        else:
+            # More than 3 - take last 3
+            withdrawal = float(amounts[-3].replace(',', ''))
+            deposit = float(amounts[-2].replace(',', ''))
+            balance = float(amounts[-1].replace(',', ''))
+        
+        # Clean narration
+        narration_text = re.sub(r'\b(MB\w+|0{4}\d{12,16})\b', '', narration_section)
+        narration_text = re.sub(r'\s+', ' ', narration_text).strip()
+        
+        print(f"  RESULT: W={withdrawal}, D={deposit}, B={balance}")
+        
+        return {
+            'Date': pd.to_datetime(date_str, format='%d/%m/%y', errors='coerce'),
+            'Narration': narration_text,
+            'Withdrawal Amt.': withdrawal,
+            'Deposit Amt.': deposit,
+            'Closing Balance': balance
+        }
+    
+    except Exception as e:
+        print(f"DEBUG: Error: {e}")
+        return None
 
 def parse_axis_bank_format1(text: str) -> pd.DataFrame:
     transactions = []
