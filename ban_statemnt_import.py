@@ -5014,6 +5014,186 @@ def parse_yes_bank_format2(text: str) -> pd.DataFrame:
     df = df.dropna(subset=['Date'])
     return df
 
+def parse_au_bank_format4(text: str) -> pd.DataFrame:
+    transactions = []
+    print("--- Starting AU Bank (Format 4) Parser ---")
+
+    # Pattern to find transaction date lines
+    date_line_pattern = re.compile(r"^(\d{2}\s\w{3}\s\d{4})\s+(\d{2}\s\w{3}\s\d{4})$")
+    
+    # Pattern to find money lines (with or without dashes for zero values)
+    # Handles: "N093242966171056 -  1,63,666.00  1,73,666.80"
+    # Handles: "409321190797  69,333.00 -  1,04,333.80"  
+    # Handles: "-  30,648.00  40,719.78"
+    # Handles: "69,333.00 -  10,000.80"
+    money_line_pattern = re.compile(r"^\s*(?:[\w\d]+\s+)?(-|[\d,]+\.\d{2})\s+(-|[\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$")
+
+    # Find Opening Balance
+    last_balance = None
+    ob_match = re.search(r"Opening Balance\(₹\)\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
+    if ob_match:
+        try:
+            bal_str = ob_match.group(1).replace(',', '')
+            last_balance = float(bal_str)
+            print(f"Found Opening Balance: {last_balance}")
+        except Exception:
+            pass
+    
+    # --- State Machine Variables ---
+    current_date = None
+    current_narration_lines = []
+    data_started = False
+    
+    lines = text.split('\n')
+    print(f"\nDEBUG: Total lines in PDF: {len(lines)}")
+    
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        
+        # Find header
+        if not data_started:
+            if "Description/Narration" in line or (i > 0 and "Transaction" in lines[i-1] and "Date Value Date" in line):
+                data_started = True
+                print(f"✓ Header found at line {i}")
+                continue
+            continue
+        
+        # Skip junk lines
+        if not line_stripped or \
+           "--- PAGE BREAK ---" in line_stripped or \
+           "ACCOUNT STATEMENT" in line_stripped or \
+           "This is an auto-generated" in line_stripped or \
+           "Page " in line_stripped or \
+           "Customer ID" in line_stripped or \
+           line_stripped.startswith("Call us at") or \
+           line_stripped.startswith("Website"):
+            continue
+        
+        # Check if this is a date line (start of new transaction)
+        date_match = date_line_pattern.match(line_stripped)
+        
+        if date_match:
+            # Process previous transaction if exists
+            if current_date and current_narration_lines:
+                # Try to find money line in accumulated narration
+                money_line_found = False
+                for narr_line in current_narration_lines:
+                    money_match = money_line_pattern.match(narr_line)
+                    if money_match:
+                        try:
+                            debit_str = money_match.group(1)
+                            credit_str = money_match.group(2)
+                            balance_str = money_match.group(3)
+                            
+                            # Clean amounts
+                            debit = 0.0 if debit_str == '-' else float(debit_str.replace(',', ''))
+                            credit = 0.0 if credit_str == '-' else float(credit_str.replace(',', ''))
+                            balance = float(balance_str.replace(',', ''))
+                            
+                            # Build narration (exclude the money line)
+                            narration_parts = [l for l in current_narration_lines if l != narr_line]
+                            narration = " ".join(narration_parts).strip()
+                            
+                            # Determine withdrawal/deposit based on balance change
+                            withdrawal, deposit = 0.0, 0.0
+                            amount = debit if debit > 0 else credit
+                            
+                            if last_balance is not None:
+                                if balance > last_balance + 0.001:
+                                    deposit = amount
+                                elif balance < last_balance - 0.001:
+                                    withdrawal = amount
+                            else:
+                                # Fallback: credit column has value = deposit
+                                if credit > 0:
+                                    deposit = credit
+                                else:
+                                    withdrawal = debit
+                            
+                            txn_data = {
+                                'Date': pd.to_datetime(current_date, format='%d %b %Y', errors='coerce'),
+                                'Narration': narration,
+                                'Withdrawal Amt.': withdrawal,
+                                'Deposit Amt.': deposit,
+                                'Closing Balance': balance
+                            }
+                            
+                            transactions.append(txn_data)
+                            last_balance = balance
+                            money_line_found = True
+                            break
+                            
+                        except Exception as e:
+                            print(f"Error processing transaction: {e}")
+                            continue
+                
+                if not money_line_found:
+                    print(f"Warning: No money line found for transaction on {current_date}")
+            
+            # Start new transaction
+            current_date = date_match.group(1)  # Transaction date
+            current_narration_lines = []
+            
+        elif current_date:
+            # Accumulate narration lines
+            current_narration_lines.append(line_stripped)
+    
+    # Process last transaction
+    if current_date and current_narration_lines:
+        for narr_line in current_narration_lines:
+            money_match = money_line_pattern.match(narr_line)
+            if money_match:
+                try:
+                    debit_str = money_match.group(1)
+                    credit_str = money_match.group(2)
+                    balance_str = money_match.group(3)
+                    
+                    debit = 0.0 if debit_str == '-' else float(debit_str.replace(',', ''))
+                    credit = 0.0 if credit_str == '-' else float(credit_str.replace(',', ''))
+                    balance = float(balance_str.replace(',', ''))
+                    
+                    narration_parts = [l for l in current_narration_lines if l != narr_line]
+                    narration = " ".join(narration_parts).strip()
+                    
+                    withdrawal, deposit = 0.0, 0.0
+                    amount = debit if debit > 0 else credit
+                    
+                    if last_balance is not None:
+                        if balance > last_balance + 0.001:
+                            deposit = amount
+                        elif balance < last_balance - 0.001:
+                            withdrawal = amount
+                    else:
+                        if credit > 0:
+                            deposit = credit
+                        else:
+                            withdrawal = debit
+                    
+                    txn_data = {
+                        'Date': pd.to_datetime(current_date, format='%d %b %Y', errors='coerce'),
+                        'Narration': narration,
+                        'Withdrawal Amt.': withdrawal,
+                        'Deposit Amt.': deposit,
+                        'Closing Balance': balance
+                    }
+                    
+                    transactions.append(txn_data)
+                    break
+                    
+                except Exception as e:
+                    print(f"Error processing last transaction: {e}")
+                    continue
+    
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+
+    print(f"\n✓✓✓ Parser finished: Extracted {len(transactions)} transactions.")
+    df = pd.DataFrame(transactions)
+    df = df.dropna(subset=['Date'])
+    return df
+
+
 def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     """
     Main router function. Extracts text and routes to the correct parser
@@ -5208,6 +5388,42 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
         else:
             print(" -> Using IndusInd Format 1.")
             return parse_indusind_bank(text)
+        
+
+    elif "AU" in upper_filename:
+        print("Bank identified by filename as: AU Small Finance Bank.")
+        
+        # Debug: print first 1500 chars
+        print(f"DEBUG Router: First 1500 chars of text:\n{text[:1500]}\n")
+        print(f"DEBUG Router: First 500 chars of upper_text:\n{upper_text[:500]}\n")
+        
+        # Internal check for AU's formats
+        # Check for Format 4 (new format) - multiple ways to detect
+        format4_indicators = [
+            "TRANSACTION" in upper_text and "VALUE DATE" in upper_text,
+            "DESCRIPTION/NARRATION" in upper_text,
+            "ACCOUNT STATEMENT" in upper_text and "AU SMALL FINANCE BANK" in upper_text
+        ]
+        
+        if any(format4_indicators):
+            print(" -> Using AU Format 4 (v4 parser) - New format detected")
+            return parse_au_bank_format4(text)
+        
+        # Check for Format 3 (Format 9 in your code)
+        elif "TXNDATEVALUE" in clean_upper_text:
+            print(" -> Using AU Format 3 (v9 parser).")
+            return parse_au_bank_format3(text)
+        
+        else:
+            print(" -> Using AU Format 1 (original parser).")
+            result = parse_au_bank(text)
+            
+            # If Format 1 fails, try Format 4 as fallback
+            if result.empty:
+                print(" -> Format 1 failed, trying Format 4 as fallback...")
+                return parse_au_bank_format4(text)
+            
+            return result
 
     elif "KOTAK" in upper_filename or "KKBK" in clean_upper_text:
         print("Bank identified by filename as: Kotak Bank.")
@@ -5291,15 +5507,7 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
         print("Bank identified by filename as: Federal Bank.")
         return parse_federal_bank(text)
         
-    elif "AU" in upper_filename:
-        print("Bank identified by filename as: AU Small Finance Bank.")
-        # Internal check for AU's two formats
-        if "TXNDATEVALUE" in clean_upper_text:
-            print(" -> Using AU Format 2 (v9 parser).")
-            return parse_au_bank_format3(text) # The new parser
-        else:
-            print(" -> Using AU Format 1 (original parser).")
-            return parse_au_bank(text) # Your original parser
+    
 
     elif "BANDHAN" in upper_filename:
         print("Bank identified by filename as: Bandhan Bank.")
