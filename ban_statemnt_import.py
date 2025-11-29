@@ -5362,6 +5362,21 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
         else:
             print(" -> No specific HDFC header found, trying Format 1 as default.")
             return parse_hdfc_bank(text)
+        
+
+    elif "AXIS" in upper_filename:
+        print("Bank identified by filename as: Axis.")
+        # Internal check for Axis's two formats
+        if "S.NOTRANSACTION" in clean_upper_text:
+            print(" -> Using Axis Format 1.")
+            return parse_axis_bank_format1(text)
+        elif "TRANDATECHQNO" in clean_upper_text:
+            print(" -> Using Axis Format 2.")
+            return parse_axis_bank_format2(text)
+        else:
+            df = parse_axis_bank_format1(text)
+            if not df.empty: return df
+            return parse_axis_bank_format2(text)
 
     elif "INDUSIND" in upper_filename or "INDB" in clean_upper_text: # Corrected from INDUSLAND
         print("Bank identified by filename as: IndusInd Bank.")
@@ -5424,6 +5439,26 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
                 return parse_au_bank_format4(text)
             
             return result
+        
+
+    elif "ICICI" in upper_filename:
+        print("Bank identified by filename as: ICICI Bank.")
+        
+        # Internal check for ICICI's three formats
+        # We check for the most unique headers first
+        
+        if "DATE DESCRIPTION AMOUNT TYPE" in upper_text:
+            print(" -> Using ICICI Format 3 (v3 parser).")
+            return parse_icici_bank_format3(text)
+            
+        elif "SNO.VALUEDATETRANSACTIONDATE" in clean_upper_text:
+            print(" -> Using ICICI Format 2 (v2 parser).")
+            return parse_icici_bank_format2(text)
+            
+        else:
+            # Fallback to original parser
+            print(" -> Using ICICI Format 1 (original parser).")
+            return parse_icici_bank(text)
 
     elif "KOTAK" in upper_filename or "KKBK" in clean_upper_text:
         print("Bank identified by filename as: Kotak Bank.")
@@ -5539,38 +5574,9 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
 
     
 
-    elif "AXIS" in upper_filename:
-        print("Bank identified by filename as: Axis.")
-        # Internal check for Axis's two formats
-        if "S.NOTRANSACTION" in clean_upper_text:
-            print(" -> Using Axis Format 1.")
-            return parse_axis_bank_format1(text)
-        elif "TRANDATECHQNO" in clean_upper_text:
-            print(" -> Using Axis Format 2.")
-            return parse_axis_bank_format2(text)
-        else:
-            df = parse_axis_bank_format1(text)
-            if not df.empty: return df
-            return parse_axis_bank_format2(text)
+    
             
-    elif "ICICI" in upper_filename:
-        print("Bank identified by filename as: ICICI Bank.")
-        
-        # Internal check for ICICI's three formats
-        # We check for the most unique headers first
-        
-        if "DATE DESCRIPTION AMOUNT TYPE" in upper_text:
-            print(" -> Using ICICI Format 3 (v3 parser).")
-            return parse_icici_bank_format3(text)
-            
-        elif "SNO.VALUEDATETRANSACTIONDATE" in clean_upper_text:
-            print(" -> Using ICICI Format 2 (v2 parser).")
-            return parse_icici_bank_format2(text)
-            
-        else:
-            # Fallback to original parser
-            print(" -> Using ICICI Format 1 (original parser).")
-            return parse_icici_bank(text)
+    
                    
     # ---
     # 4. FINAL FALLBACK
