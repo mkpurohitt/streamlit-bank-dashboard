@@ -5385,6 +5385,101 @@ def parse_au_bank_format5(text: str) -> pd.DataFrame:
     df = df.dropna(subset=['Date'])
     return df
 
+# --- (NEW Parser: PNB - Format 3 - Converted/Excel Style) ---
+def parse_punjab_national_bank_format3(text: str) -> pd.DataFrame:
+    transactions = []
+    print("--- Starting PNB (Format 3 - Converted) Parser ---")
+
+    # 1. Clean the text (Remove quotes)
+    clean_text = text.replace('"', '').replace("'", "")
+
+    # Pattern for dates like "18-Aug-2025"
+    date_start_pattern = re.compile(r"^(\d{2}-\w{3}-\d{4})")
+    
+    def clean_amt(s):
+        if not s or s.strip() == '': return 0.0
+        return float(s.replace(',', '').strip())
+
+    # --- Helper function to process a finished block ---
+    def process_block(block_lines):
+        if not block_lines: return None
+        
+        full_block = " ".join(block_lines).replace('\n', ' ').strip()
+        full_block = re.sub(r'\s+', ' ', full_block)
+        
+        match = date_start_pattern.match(full_block)
+        if not match: return None
+        
+        try:
+            date_str = match.group(1)
+            
+            # Remove the date from the start
+            rest_of_line = full_block[len(date_str):].strip()
+            
+            # The layout is usually: [Cheque No] [Withdrawal] [Deposit] [Balance] [Narration]
+            # But Cheque No is optional and often merged.
+            # Strategy: Find the FIRST sequence of 3 numbers (W, D, B)
+            
+            # Regex to find: (Number) space (Number) space (Number)
+            # We look for 3 numbers. The first two can be "-" or 0.00
+            money_match = re.search(r"([\d,.-]+)\s+([\d,.-]+)\s+([\d,.-]+)(.*)", rest_of_line)
+            
+            if not money_match:
+                return None
+                
+            w_str, d_str, b_str, narration = money_match.groups()
+            
+            # If the bit *before* the money match (the cheque number part) is suspiciously long
+            # it might mean we missed the cheque number column. 
+            # (Skipping complex cheque logic for now as PNB converted files are often messy here)
+
+            withdrawal = clean_amt(w_str.replace('-', '0'))
+            deposit = clean_amt(d_str.replace('-', '0'))
+            balance = clean_amt(b_str)
+            
+            txn_data = {
+                'Date': pd.to_datetime(date_str, format='%d-%b-%Y', errors='coerce'),
+                'Narration': narration.strip(),
+                'Withdrawal Amt.': withdrawal,
+                'Deposit Amt.': deposit,
+                'Closing Balance': balance
+            }
+            return txn_data
+
+        except Exception as e:
+            return None
+
+    # --- State Machine ---
+    current_block_lines = []
+    
+    for line in clean_text.split('\n'):
+        line = line.strip()
+        
+        if not line or "--- PAGE BREAK ---" in line:
+            continue
+            
+        if date_start_pattern.match(line):
+            if current_block_lines:
+                parsed_txn = process_block(current_block_lines)
+                if parsed_txn: transactions.append(parsed_txn)
+            
+            current_block_lines = [line]
+        elif current_block_lines:
+            current_block_lines.append(line)
+            
+    if current_block_lines:
+        parsed_txn = process_block(current_block_lines)
+        if parsed_txn: transactions.append(parsed_txn)
+
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+
+    print(f"--- Parser finished: Extracted {len(transactions)} transactions. ---")
+    df = pd.DataFrame(transactions)
+    df = df.dropna(subset=['Date'])
+    return df
+
 def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     """
     Main router function. Extracts text and routes to the correct parser
@@ -5411,14 +5506,20 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     if "PUNJAB NATIONAL" in upper_filename or "PNB" in upper_filename:
         print("Bank identified by filename as: Punjab National Bank.")
         
-        # Internal check for PNB's two formats
-        # We check for the new format's unique header
-        if "DATEINSTRUMENTIDAMOUNTTYPEBALANCEREMARKS" in clean_upper_text:
+        # --- CHECK 1: Format 3 (Converted File) ---
+        # Detects dates like "18-Aug-2025" which are specific to the converted file
+        if re.search(r"\d{2}-\w{3}-\d{4}", text):
+             print(" -> Detected 'dd-Mmm-yyyy' dates. Using PNB Format 3 (Converted).")
+             return parse_punjab_national_bank_format3(text)
+
+        # --- CHECK 2: Format 2 (New Digital) ---
+        elif "DATEINSTRUMENTIDAMOUNTTYPEBALANCEREMARKS" in clean_upper_text:
             print(" -> Using PNB Format 2 (v2 parser).")
             return parse_punjab_national_bank_v2(text)
+            
+        # --- CHECK 3: Format 1 (Standard Digital - ENCRYPT.pdf) ---
         else:
-            # Fallback to original parser
-            print(" -> Using PNB Format 1 (original parser).")
+            print(" -> Using PNB Format 1 (Standard/Original).")
             return parse_punjab_national_bank_v1(text)
 
     elif "YES BANK" in upper_filename:
