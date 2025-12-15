@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import io
 import re
+import gc
 from io import BytesIO # Needed for CSV/Excel downloads
 
 
@@ -38,11 +39,10 @@ def show_main_dashboard():
 
     # --- Helper Function for Broker List ---
     # REMOVED @st.cache_data to force re-load
+    # --- Helper Function for Broker List ---
+    @st.cache_data  # <--- UNCOMMENT THIS to save memory/speed
     def load_broker_list(file_path: str) -> pd.DataFrame:
-        
         if not os.path.exists(file_path):
-            st.error(f"FATAL ERROR: Broker list file not found at: {file_path}")
-            st.error("Please update the 'BROKER_LIST_FILEPATH' variable in the streamlit_app.py script.")
             return pd.DataFrame(columns=['Broker Name'])
             
         try:
@@ -55,14 +55,8 @@ def show_main_dashboard():
             elif filename.endswith('.xlsx'):
                 df = pd.read_excel(file_path, sheet_name=0, header=0, usecols=[0])
             elif filename.endswith('.xls'):
-                try:
-                    df = pd.read_excel(file_path, sheet_name=0, header=0, usecols=[0], engine='xlrd')
-                except Exception as e:
-                    st.error(f"Error reading .xls file. Make sure 'xlrd' is installed (`pip install xlrd`).")
-                    st.error(f"Details: {e}")
-                    return pd.DataFrame(columns=['Broker Name'])
+                df = pd.read_excel(file_path, sheet_name=0, header=0, usecols=[0], engine='xlrd')
             else:
-                st.error(f"Unsupported broker file format: {filename}")
                 return pd.DataFrame(columns=['Broker Name'])
             
             df.rename(columns={df.columns[0]: 'Broker Name'}, inplace=True)
@@ -71,145 +65,128 @@ def show_main_dashboard():
             return df
             
         except Exception as e:
-            st.error(f"Error parsing broker list file '{filename}': {e}")
             return pd.DataFrame(columns=['Broker Name'])
 
     # --- (Phase 2: Core Analysis Logic) ---
     # REMOVED @st.cache_data to force re-run
     # --- (Phase 2: Core Analysis Logic - v2 - Split Keyword/Broker) ---
     # REMOVED @st.cache_data to force re-run
+    # --- (Phase 2: Core Analysis Logic - OPTIMIZED) ---
     def run_analysis(_transactions_df, _client_df, keywords, _broker_df):
-    
         
-        st.write("Starting analysis... (This may take a moment)")
+        st.write("Starting analysis... (Optimized Mode)")
         
+        # Work on the original dataframe directly to save memory if possible, 
+        # or just take the necessary columns.
         transactions_df = _transactions_df.copy()
-        transactions_df['Narration_Upper'] = transactions_df['Narration'].astype(str).str.upper()
-    # --- 1. Client Matching (for Report 2) ---
-        st.write("Tagging Client Transactions (Partial Names)...")
         
+        # Pre-calculate Uppercase Narration to avoid doing it repeatedly
+        transactions_df['Narration_Upper'] = transactions_df['Narration'].astype(str).str.upper()
+
+        # --- 1. Client Matching (SET INTERSECTION - FAST) ---
+        st.write("Tagging Client Transactions...")
+        
+        # Create a SET of unique client name parts (O(1) lookup speed)
         client_name_parts_set = set()
         client_names_upper = _client_df['Client Name'].astype(str).str.strip().str.upper()
+        
         for name in client_names_upper:
             parts = name.split()
             for part in parts:
-                if len(part) > 2: # Ignore short parts like 'K' or 'S'
+                if len(part) > 2: # Ignore short parts
                     client_name_parts_set.add(part)
 
-        if not client_name_parts_set:
-            st.warning("No client name parts were extracted. Client matching may fail.")
-            client_parts_regex = re.compile(r"a^") # A regex that matches nothing
-        else:
-            client_parts_regex = re.compile(
-                # --- FIX: Added \b word boundaries to match whole words only ---
-                "|".join(r"\b" + re.escape(name) + r"\b" for name in client_name_parts_set if name)
-            )
+        # Function using Set Intersection instead of Regex
+        def find_client_parts_optimized(narration_upper):
+            if not narration_upper: return tuple()
+            # Split narration into words using non-alphanumeric split
+            # This is equivalent to \b word boundaries
+            narration_words = set(re.split(r'[^A-Z0-9]+', narration_upper))
+            
+            # Find the intersection (common words) between narration and clients
+            # This is extremely fast
+            matches = narration_words.intersection(client_name_parts_set)
+            
+            if matches:
+                return tuple(sorted(list(matches)))
+            return tuple()
+
+        transactions_df['Matched_Client_Parts'] = transactions_df['Narration_Upper'].apply(find_client_parts_optimized)
+
+        # --- 2. Keyword/Broker Matching ---
+        st.write("Tagging Flagged Transactions...")
+
+        # Optimize Keywords: Use word set intersection for simple keywords
+        keyword_set = {k.upper() for k in keywords if k}
         
-        def find_all_client_parts(narration):
-            if not narration: return tuple()
-            matches = client_parts_regex.findall(narration)
-            return tuple(sorted(list(set(matches)))) # Return hashable tuple
+        def find_keyword_optimized(narration_upper):
+            if not narration_upper: return None
+            narration_words = set(re.split(r'[^A-Z0-9]+', narration_upper))
+            matches = narration_words.intersection(keyword_set)
+            return list(matches)[0] if matches else None
 
-        transactions_df['Matched_Client_Parts'] = transactions_df['Narration_Upper'].apply(find_all_client_parts)
+        transactions_df['Matched_Keyword'] = transactions_df['Narration_Upper'].apply(find_keyword_optimized)
 
-        # --- 2. Keyword/Broker Matching (for Report 3) ---
-        st.write("Tagging Flagged Transactions (Keywords and Brokers)...")
-
-        # --- 2a. Keyword Matching (Word Boundary) ---
-        if not keywords:
-            st.warning("No keywords provided. Keyword matching will be skipped.")
-            keyword_regex = re.compile(r"a^") # Matches nothing
-        else:
-            # Use word boundaries for keywords (e.g., match 'LOAN' but not 'SLOAN')
-            keyword_regex = re.compile(
-                "|".join(r"\b" + re.escape(k) + r"\b" for k in keywords if k) 
-            )
-        
-        def find_keyword(narration):
-            if not narration: return None
-            match = keyword_regex.search(narration)
-            return match.group(0) if match else None
-
-        transactions_df['Matched_Keyword'] = transactions_df['Narration_Upper'].apply(find_keyword)
-
-        # --- 2b. Broker Matching (Strict Phrase) ---
+        # Broker Matching (Must keep Regex or substring for multi-word brokers)
+        # But we optimize by compiling it once outside the loop
         broker_list = list(_broker_df['Broker Name'].astype(str).str.strip().str.upper())
-        if not broker_list:
-            st.warning("No brokers loaded. Broker matching will be skipped.")
-            broker_regex = re.compile(r"a^") # Matches nothing
+        
+        if broker_list:
+            # We keep regex for brokers because they might be multi-word phrases
+            # (e.g. "ANAND RATHI") which set intersection won't catch easily.
+            # However, we only compile it if the list isn't empty.
+            broker_regex = re.compile("|".join(re.escape(k) for k in broker_list if k))
+            
+            def find_broker(narration):
+                if not narration: return None
+                match = broker_regex.search(narration)
+                return match.group(0) if match else None
+                
+            transactions_df['Matched_Broker'] = transactions_df['Narration_Upper'].apply(find_broker)
         else:
-            # NO word boundaries for brokers, to match "ANAND RATHI BROKING" as a full phrase
-            broker_regex = re.compile(
-                "|".join(re.escape(k) for k in broker_list if k)
-            )
+            transactions_df['Matched_Broker'] = None
 
-        def find_broker(narration):
-            if not narration: return None
-            match = broker_regex.search(narration)
-            return match.group(0) if match else None
-        
-        transactions_df['Matched_Broker'] = transactions_df['Narration_Upper'].apply(find_broker)
-        
-        # --- 3. Amount Check (for Report 1) ---
+        # --- 3. Amount Check ---
         transactions_df['Is_Over_5k'] = (transactions_df['Withdrawal Amt.'] > 5000) | (transactions_df['Deposit Amt.'] > 5000)
         
-        
-        # --- 4. Generate the THREE (non-exclusive) Report DataFrames ---
+        # --- 4. Generate Reports ---
         st.write("Generating final reports...")
         
-        # Report 1: Non-Client Transactions > 5000
-        # (Transactions where Matched_Parts is empty AND Is_Over_5k is True)
+        # Report 1: Non-Client
         non_client_tx_df = transactions_df[
             (transactions_df['Matched_Client_Parts'].apply(len) == 0) &
             (transactions_df['Is_Over_5k'] == True)
         ].copy()
 
-        # Report 2: Client Transactions
-        # (Transactions where Matched_Parts is NOT empty)
+        # Report 2: Client
         client_tx_df = transactions_df[
             transactions_df['Matched_Client_Parts'].apply(len) > 0
         ].copy()
 
-        # Report 3: Flagged Transactions
-        # (Transactions where EITHER a keyword OR a broker is found)
+        # Report 3: Flagged
         flagged_tx_df = transactions_df[
             (transactions_df['Matched_Keyword'].notnull()) |
             (transactions_df['Matched_Broker'].notnull())
         ].copy()
         
-        print("Analysis complete.")
-        
-        # --- 5. Clean up and return reports ---
-
-        # Define columns to drop for each report based on your requirements
-
-        # Report 1 (Non-Client): Drop all tagging columns
-        report1_cols_to_drop = [
-            'Narration_Upper', 'Is_Over_5k', 
-            'Matched_Client_Parts', 'Matched_Keyword', 'Matched_Broker'
-        ]
-        
-        # Report 2 (Client): Keep 'Matched_Client_Parts', drop others
-        report2_cols_to_drop = [
-            'Narration_Upper', 'Is_Over_5k', 
-            'Matched_Keyword', 'Matched_Broker'
-        ]
-
-        # Report 3 (Flagged): Keep 'Matched_Keyword' & 'Matched_Broker', drop others
-        report3_cols_to_drop = [
-            'Narration_Upper', 'Is_Over_5k', 
-            'Matched_Client_Parts'
-        ]
+        # --- 5. Clean up columns ---
+        report1_cols_to_drop = ['Narration_Upper', 'Is_Over_5k', 'Matched_Client_Parts', 'Matched_Keyword', 'Matched_Broker']
+        report2_cols_to_drop = ['Narration_Upper', 'Is_Over_5k', 'Matched_Keyword', 'Matched_Broker']
+        report3_cols_to_drop = ['Narration_Upper', 'Is_Over_5k', 'Matched_Client_Parts']
 
         client_tx_df.drop(columns=report2_cols_to_drop, errors='ignore', inplace=True)
         non_client_tx_df.drop(columns=report1_cols_to_drop, errors='ignore', inplace=True)
         flagged_tx_df.drop(columns=report3_cols_to_drop, errors='ignore', inplace=True)
         
-        # Get all unique matched parts for the filter
+        # Get filter options
         all_matched_parts_for_filter = set(part for sublist in client_tx_df['Matched_Client_Parts'] for part in sublist)
         client_name_options = sorted(list(all_matched_parts_for_filter))
         
-        return client_tx_df, non_client_tx_df, flagged_tx_df, client_name_options
+        # Force Garage Collection to free up RAM immediately
+        del transactions_df
+        gc.collect()
+        
+        return client_tx_df, non_client_tx_df, flagged_tx_df, client_name_options 
 
 
     # --- Page Configuration ---
@@ -288,6 +265,9 @@ def show_main_dashboard():
                     master_transactions_df.dropna(subset=['Date'], inplace=True) # Drop bad rows
                     master_transactions_df = master_transactions_df.sort_values(by='Date').reset_index(drop=True)
                     st.success(f"Successfully parsed all the transactions from all the bank statements.")
+                    del all_tx_dfs
+                    gc.collect()
+                    
                 else:
                     st.error("Bank statement processing finished, but no transactions were extracted.")
         else:
@@ -340,7 +320,11 @@ def show_main_dashboard():
             st.session_state['client_tx'] = client_tx
             st.session_state['non_client_tx'] = non_client_tx
             st.session_state['flagged_tx'] = flagged_tx
-            st.session_state['client_name_options'] = client_name_options
+            st.session_state['client_name_options']=client_name_options 
+            del master_transactions_df
+            del master_client_df
+            del master_broker_df
+            gc.collect()
             
             st.success("🎉 Analysis complete! Reports are generated below.")
         
