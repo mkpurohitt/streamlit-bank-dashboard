@@ -5386,90 +5386,174 @@ def parse_au_bank_format5(text: str) -> pd.DataFrame:
     return df
 
 # --- (NEW Parser: PNB - Format 3 - Converted/Excel Style) ---
+# --- (REFINED Parser: PNB - Format 3 - Converted/Excel Style) ---
+# --- (REFINED Parser: PNB - Format 3 - CSV/Converted Style) ---
 def parse_punjab_national_bank_format3(text: str) -> pd.DataFrame:
     transactions = []
-    print("--- Starting PNB (Format 3 - Converted) Parser ---")
-
-    # 1. Clean the text (Remove quotes)
-    clean_text = text.replace('"', '').replace("'", "")
+    print("--- Starting PNB (Format 3 - CSV) Parser ---")
 
     # Pattern for dates like "18-Aug-2025"
     date_start_pattern = re.compile(r"^(\d{2}-\w{3}-\d{4})")
     
+    # Track previous balance for validation
+    last_balance = None
+
     def clean_amt(s):
-        if not s or s.strip() == '': return 0.0
-        return float(s.replace(',', '').strip())
-
-    # --- Helper function to process a finished block ---
-    def process_block(block_lines):
-        if not block_lines: return None
-        
-        full_block = " ".join(block_lines).replace('\n', ' ').strip()
-        full_block = re.sub(r'\s+', ' ', full_block)
-        
-        match = date_start_pattern.match(full_block)
-        if not match: return None
-        
+        if not s: return 0.0
+        # Remove commas, 'Cr', 'Dr', and quotes
+        s = s.replace('"', '').replace("'", "").replace(',', '').lower()
+        s = s.replace('cr', '').replace('dr', '').strip()
+        if s == '' or s == '-': return 0.0
         try:
-            date_str = match.group(1)
-            
-            # Remove the date from the start
-            rest_of_line = full_block[len(date_str):].strip()
-            
-            # The layout is usually: [Cheque No] [Withdrawal] [Deposit] [Balance] [Narration]
-            # But Cheque No is optional and often merged.
-            # Strategy: Find the FIRST sequence of 3 numbers (W, D, B)
-            
-            # Regex to find: (Number) space (Number) space (Number)
-            # We look for 3 numbers. The first two can be "-" or 0.00
-            money_match = re.search(r"([\d,.-]+)\s+([\d,.-]+)\s+([\d,.-]+)(.*)", rest_of_line)
-            
-            if not money_match:
-                return None
-                
-            w_str, d_str, b_str, narration = money_match.groups()
-            
-            # If the bit *before* the money match (the cheque number part) is suspiciously long
-            # it might mean we missed the cheque number column. 
-            # (Skipping complex cheque logic for now as PNB converted files are often messy here)
+            return float(s)
+        except:
+            return 0.0
 
-            withdrawal = clean_amt(w_str.replace('-', '0'))
-            deposit = clean_amt(d_str.replace('-', '0'))
-            balance = clean_amt(b_str)
+    def process_line(line, prev_balance):
+        # Remove leading/trailing whitespace
+        line = line.strip()
+        if not line: return None, prev_balance
+
+        # --- STRATEGY 1: CSV SPLIT (Best for "PNB (1).pdf") ---
+        # The file has format: "Date",,"Withdrawal",,"Balance","Narration"
+        # We try to split by '","' which is the standard delimiter in this file
+        
+        # Temp replace the delimiter to something unique to split easily
+        csv_line = line.replace('","', '|')
+        csv_line = csv_line.replace('",,"', '||') # Handle empty columns
+        csv_line = csv_line.replace('"', '') # Remove remaining quotes
+        
+        parts = csv_line.split('|')
+        
+        # We expect approx 5-6 columns: Date, Cheque, W, D, Balance, Narration
+        # But splitting might give variable length if empty fields are missing quotes
+        
+        # If we have a comma-rich line, use simple comma split as fallback
+        if len(parts) < 3 and ',' in line:
+             parts = line.split(',')
+
+        date_match = date_start_pattern.search(parts[0])
+        if not date_match:
+            return None, prev_balance
             
-            txn_data = {
+        date_str = date_match.group(1)
+        
+        withdrawal = 0.0
+        deposit = 0.0
+        balance = 0.0
+        narration = ""
+
+        # CSV Logic: Explicit Columns
+        # Indices based on header: Date(0), Cheque(1), Withdrawal(2), Deposit(3), Balance(4), Narration(5)
+        # Note: Empty columns might shift indices if using simple split, but '","' replace handles it better.
+        
+        if len(parts) >= 5:
+            # We assume the layout matches the header we saw
+            try:
+                # Part 0 is Date
+                # Part 1 is Cheque (skip)
+                
+                # Check if Part 2 looks like a number (Withdrawal)
+                w_val = clean_amt(parts[2])
+                
+                # Check if Part 3 looks like a number (Deposit)
+                d_val = clean_amt(parts[3])
+                
+                # Part 4 is Balance
+                b_val = clean_amt(parts[4])
+                
+                # Part 5+ is Narration
+                if len(parts) > 5:
+                    narration = " ".join(parts[5:]).strip()
+                
+                # Logic check: PNB CSV often puts the Amount in one col and leaves other empty
+                # We trust the columns explicitly.
+                withdrawal = w_val
+                deposit = d_val
+                balance = b_val
+                
+                return {
+                    'Date': pd.to_datetime(date_str, format='%d-%b-%Y', errors='coerce'),
+                    'Narration': narration,
+                    'Withdrawal Amt.': withdrawal,
+                    'Deposit Amt.': deposit,
+                    'Closing Balance': balance
+                }, balance
+                
+            except Exception:
+                pass # Fallback to Strategy 2
+
+        # --- STRATEGY 2: REGEX SEARCH (Fallback) ---
+        # If CSV splitting failed (e.g. text extraction removed commas), we scan for numbers.
+        
+        # Remove the date
+        clean_line = line[len(date_str):]
+        
+        # Find all numbers in the remainder
+        numbers = re.findall(r'([\d,]+\.\d{2})', clean_line)
+        
+        if len(numbers) >= 1:
+            # Last number is Balance
+            balance = float(numbers[-1].replace(',', ''))
+            
+            amount = 0.0
+            if len(numbers) >= 2:
+                amount = float(numbers[-2].replace(',', ''))
+                
+            # Narration extraction
+            # Everything after the numbers? Or before?
+            # In PNB CSV, Narration is at the END.
+            # "1000.00 50000.00 Cr. ATM WITHDRAWAL"
+            
+            # Remove the found numbers to isolate narration
+            temp_line = clean_line
+            for n in numbers:
+                temp_line = temp_line.replace(n, "")
+            
+            # Clean junk like "Cr.", "Dr.", commas
+            narration = temp_line.replace("Cr.", "").replace("Dr.", "").replace(",", "").strip()
+            
+            # --- BALANCE LOGIC (Crucial for fixing "Balance as Deposit") ---
+            if prev_balance is not None:
+                if balance > prev_balance + 0.001:
+                    deposit = abs(balance - prev_balance)
+                elif balance < prev_balance - 0.001:
+                    withdrawal = abs(balance - prev_balance)
+                else:
+                    # Balance unchanged, use 'amount' if found
+                    if amount > 0:
+                        # Guess based on extracted columns or keywords
+                        if "WITHDRAWAL" in line.upper() or "DR" in line.upper():
+                            withdrawal = amount
+                        else:
+                            deposit = amount
+            else:
+                # First row fallback: If we found explicit columns in CSV logic, we used them.
+                # If we are here, we are guessing.
+                if amount > 0:
+                    withdrawal = amount # Default assumption if unsure
+                    
+            # If we calculated via difference, ignore the extracted 'amount' variable
+            # to avoid the "Balance read as Deposit" error.
+            
+            return {
                 'Date': pd.to_datetime(date_str, format='%d-%b-%Y', errors='coerce'),
-                'Narration': narration.strip(),
+                'Narration': narration,
                 'Withdrawal Amt.': withdrawal,
                 'Deposit Amt.': deposit,
                 'Closing Balance': balance
-            }
-            return txn_data
+            }, balance
 
-        except Exception as e:
-            return None
+        return None, prev_balance
 
-    # --- State Machine ---
-    current_block_lines = []
-    
-    for line in clean_text.split('\n'):
-        line = line.strip()
-        
-        if not line or "--- PAGE BREAK ---" in line:
-            continue
-            
-        if date_start_pattern.match(line):
-            if current_block_lines:
-                parsed_txn = process_block(current_block_lines)
-                if parsed_txn: transactions.append(parsed_txn)
-            
-            current_block_lines = [line]
-        elif current_block_lines:
-            current_block_lines.append(line)
-            
-    if current_block_lines:
-        parsed_txn = process_block(current_block_lines)
-        if parsed_txn: transactions.append(parsed_txn)
+    # --- Main Loop ---
+    for line in text.split('\n'):
+        # Only process lines that start with a date
+        if date_start_pattern.match(line.strip()):
+            parsed_txn, new_balance = process_line(line, last_balance)
+            if parsed_txn:
+                transactions.append(parsed_txn)
+                last_balance = new_balance
 
     if not transactions:
         print("--- Parser finished: No transactions were extracted. ---")
@@ -5479,7 +5563,7 @@ def parse_punjab_national_bank_format3(text: str) -> pd.DataFrame:
     df = pd.DataFrame(transactions)
     df = df.dropna(subset=['Date'])
     return df
-
+    
 def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     """
     Main router function. Extracts text and routes to the correct parser
