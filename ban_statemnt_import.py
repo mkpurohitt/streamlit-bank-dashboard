@@ -5563,7 +5563,188 @@ def parse_punjab_national_bank_format3(text: str) -> pd.DataFrame:
     df = pd.DataFrame(transactions)
     df = df.dropna(subset=['Date'])
     return df
+def parse_indusind_bank_format6(text: str) -> pd.DataFrame:
+    transactions = []
+    print("--- Starting IndusInd Bank (Format 6) Parser ---")
+
+    # First, join lines that are split dates
+    # The issue: dates look like "2025-\n11-29\n" (with trailing newline after the year)
+    # We need to remove newlines BETWEEN the date parts
+    text_cleaned = re.sub(r'(\d{4})-\s*\n\s*(\d{2})-\s*\n\s*(\d{2})', r'\1-\2-\3', text)
     
+    print(f"DEBUG: Sample of cleaned text (chars 1000-1500):\n{text_cleaned[1000:1500]}\n")
+    
+    # Money pattern: THREE numbers at end (- or number for withdrawal, - or number for deposit, balance)
+    # Note: withdrawal and deposit can be "-" (dash) for zero
+    money_pattern_end = re.compile(r'(-|[\d,.]+)\s+(-|[\d,.]+)\s+([\d,.]+)\s*$')
+
+    # Helper to clean money strings
+    def clean_money(s):
+        s = s.strip()
+        if s == '-':
+            return 0.0
+        return float(s.replace(',', ''))
+
+    # --- Helper function to process a finished block ---
+    def process_block(block_lines):
+        if not block_lines:
+            return None
+            
+        full_block = " ".join(block_lines).replace('\n', ' ').strip()
+        full_block = re.sub(r'\s+', ' ', full_block)
+        
+        print(f"\n  DEBUG: Processing block: {full_block[:120]}...")
+        
+        # Look for YYYY-MM-DD date at start
+        date_match = re.match(r'^(\d{4}-\d{2}-\d{2})', full_block)
+        
+        if not date_match:
+            print(f"    -> No date match at start")
+            return None
+        
+        print(f"    -> Date found: {date_match.group(1)}")
+        
+        money_match = money_pattern_end.search(full_block)
+        
+        if not money_match:
+            print(f"    -> No money pattern found at end. Last 80 chars: {full_block[-80:]}")
+            return None
+        
+        print(f"    -> Money found: W={money_match.group(1)}, D={money_match.group(2)}, B={money_match.group(3)}")
+            
+        try:
+            date_str = date_match.group(1)
+            withdrawal_str = money_match.group(1)
+            deposit_str = money_match.group(2)
+            balance_str = money_match.group(3)
+            
+            # Narration is between the date and the money
+            narration_start_index = date_match.end()
+            narration_end_index = money_match.start()
+            
+            if narration_start_index >= narration_end_index:
+                print(f"    -> Empty narration")
+                return None
+
+            narration = full_block[narration_start_index:narration_end_index].strip()
+            
+            # Remove reference numbers and "Chq No/Ref No" text
+            narration = re.sub(r'Chq No/Ref No', '', narration)
+            narration = re.sub(r'\b[A-Z0-9]{15,}\b', '', narration).strip()
+            narration = re.sub(r'\s+', ' ', narration).strip()
+            
+            print(f"    -> Narration: {narration[:60]}...")
+            
+            # Clean amounts
+            withdrawal = clean_money(withdrawal_str)
+            deposit = clean_money(deposit_str)
+            balance = clean_money(balance_str)
+            
+            txn_data = {
+                'Date': pd.to_datetime(date_str, format='%Y-%m-%d', errors='coerce'),
+                'Narration': narration,
+                'Withdrawal Amt.': withdrawal,
+                'Deposit Amt.': deposit,
+                'Closing Balance': balance
+            }
+            
+            print(f"    -> ✓ Transaction created successfully")
+            return txn_data
+            
+        except Exception as e:
+            print(f"    -> Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    # --- State Machine ---
+    current_block_lines = []
+    data_started = False
+    
+    # Header pattern for Format 6
+    header_pattern = re.compile(r"Withdrawal\s+Deposit\s+Balance", re.IGNORECASE)
+    
+    lines = text_cleaned.split('\n')
+    print(f"DEBUG: Total lines after cleaning: {len(lines)}")
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if not data_started:
+            if header_pattern.search(line):
+                data_started = True
+                print(f"\n✓ Header found at line {i}, starting parser.")
+            i += 1
+            continue
+        
+        # Skip junk lines
+        if not line or \
+           "--- PAGE BREAK ---" in line or \
+           "IndusInd Bank" in line or \
+           "Account Statement" in line or \
+           "This is a computer generated" in line or \
+           line.startswith("Page "):
+            i += 1
+            continue
+        
+        # Check if line is YYYY- (start of split date)
+        if re.match(r'^\d{4}-$', line):
+            # This is a split date, join it with next line
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # Check if next line is MM-DD
+                if re.match(r'^\d{2}-\d{2}$', next_line):
+                    # Join them
+                    full_date = line + next_line  # This gives us "YYYY-MM-DD"
+                    
+                    # Get the rest of the transaction (usually on line i+2)
+                    if i + 2 < len(lines):
+                        rest_of_line = lines[i + 2].strip()
+                        full_line = full_date + " " + rest_of_line
+                        
+                        print(f"\n→ Joined split date at line {i}: {full_line[:80]}...")
+                        
+                        if current_block_lines:
+                            parsed_txn = process_block(current_block_lines)
+                            if parsed_txn:
+                                transactions.append(parsed_txn)
+                        
+                        current_block_lines = [full_line]
+                        i += 3  # Skip the 3 lines we just processed
+                        continue
+        
+        # Check if line starts with complete YYYY-MM-DD date
+        if re.match(r'^\d{4}-\d{2}-\d{2}', line):
+            print(f"\n→ New transaction detected at line {i}: {line[:80]}...")
+            if current_block_lines:
+                parsed_txn = process_block(current_block_lines)
+                if parsed_txn:
+                    transactions.append(parsed_txn)
+            
+            current_block_lines = [line]
+        
+        elif current_block_lines:
+            current_block_lines.append(line)
+        
+        i += 1
+    
+    # Process last block
+    if current_block_lines:
+        print(f"\n→ Processing last block")
+        parsed_txn = process_block(current_block_lines)
+        if parsed_txn:
+            transactions.append(parsed_txn)
+        
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+
+    print(f"\n✓✓✓ Parser finished: Extracted {len(transactions)} transactions.")
+    df = pd.DataFrame(transactions)
+    df = df.dropna(subset=['Date'])
+    return df
+
 def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
     """
     Main router function. Extracts text and routes to the correct parser
@@ -5754,32 +5935,44 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
             if not df.empty: return df
             return parse_axis_bank_format2(text)
 
-    elif "INDUSIND" in upper_filename or "INDB" in clean_upper_text:
+    elif "INDUSIND" in upper_filename or "INDB" in upper_filename or "INDUS IND" in upper_filename:
         print("Bank identified by filename as: IndusInd Bank.")
         
-        # --- Format 2 (Finsense) ---
+        # --- CHECK FOR FORMAT 6 FIRST (YYYY-MM-DD date format) ---
+        # The dates might be split across lines (e.g., "2025-\n11-29")
+        # So we check for the pattern allowing for newlines
+        date_pattern_match = re.search(r'\d{4}-\s*\n?\s*\d{2}-\s*\n?\s*\d{2}', text)
+        
+        print(f"   DEBUG: Searching for YYYY-MM-DD pattern (with line breaks)...")
+        print(f"   DEBUG: Date pattern found: {date_pattern_match is not None}")
+        
+        if date_pattern_match:
+            print(f"   DEBUG: First match found: {date_pattern_match.group()}")
+            print(" -> Using IndusInd Format 6 (YYYY-MM-DD dates).")
+            return parse_indusind_bank_format6(text)
+        
+        # --- CHECK FOR FORMAT 2 (IT IS MORE SPECIFIC) ---
         if "FINSENSESECURITIES" in clean_upper_text:
             print(" -> Using IndusInd Format 2.")
             return parse_indusind_bank_format2(text)
 
-        # --- Format 5 (Bank Reference) ---
+        # --- CHECK FOR FORMAT 5 ---
         elif "BANKREFERENCEVALUEDATETRANSACTION" in clean_upper_text:
             print(" -> Using IndusInd Format 5.")
             return parse_indusind_bank_format5(text)
         
-        # --- Format 4 (The one you are fixing) ---
-        # Checks for "CHQ./REF.NO" and either "WITHDRAWAL" or "WITHDRAWL" (Typo fix)
-        elif "CHQ./REF.NO" in clean_upper_text and ("WITHDRAWAL" in clean_upper_text or "WITHDRAWL" in clean_upper_text):
-            print(" -> Using IndusInd Format 4 (Updated for quotes & typos).")
-            return parse_indusind_bank_format4(text) 
+        # --- CHECK FOR FORMAT 4 ---
+        elif "CHQ./REF.NOWITHDRAWALDEPOSITBALANCE" in clean_upper_text:
+            print(" -> Using IndusInd Format 4.")
+            return parse_indusind_bank_format4(text)
         
-        # --- Format 3 ---
+        # --- CHECK FOR FORMAT 3 ---
         elif "DATE TYPE DESCRIPTION DEBIT CREDIT BALANCE" in re.sub(r'\s+', ' ', upper_text):
             print(" -> Using IndusInd Format 3.")
             return parse_indusind_bank_format3(text)
             
         else:
-            print(" -> Using IndusInd Format 1 (default).")
+            print(" -> Using IndusInd Format 1.")
             return parse_indusind_bank(text)
 
     elif "AU SMALL FINANCE" in upper_filename or "AU BANK" in upper_filename or (("AU" in upper_filename) and ("SMALL" in upper_filename or "FINANCE" in upper_filename)):
