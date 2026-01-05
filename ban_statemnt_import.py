@@ -380,32 +380,184 @@ def parse_punjab_sind_bank(text: str) -> pd.DataFrame:
 
 def parse_canara_bank(text: str) -> pd.DataFrame:
     transactions = []
-    line_start_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}")
-    cleaned_lines = []
+    print("--- Starting Canara Bank (Format 1) Parser ---")
+    
+    # Pattern to find transaction start (DD-MM-YYYY)
+    date_start_pattern = re.compile(r"^(\d{2}-\d{2}-\d{4})")
+    
+    # Helper to clean money
+    def clean_money(s):
+        if not s or s.strip() == '' or s.strip() == '-':
+            return 0.0
+        # Remove commas
+        s = s.replace(',', '').strip()
+        # Check if it's a valid float
+        try:
+            return float(s)
+        except:
+            return 0.0
+
+    # Helper to check if a string looks like money (has decimal point)
+    def looks_like_money(s):
+        s = s.replace(',', '').strip()
+        # Money values should have decimal points (e.g., "2000.00")
+        if '.' in s:
+            try:
+                float(s)
+                return True
+            except:
+                return False
+        return False
+
+    # --- Helper function ---
+    def process_block(block_lines):
+        if not block_lines:
+            return None
+            
+        full_block = " ".join(block_lines).replace('\n', ' ').strip()
+        
+        # Remove "Chq:" lines and their associated numbers
+        full_block = re.sub(r'Chq:\s*\d*', '', full_block)
+        full_block = re.sub(r'\s+', ' ', full_block).strip()
+        
+        print(f"\n  DEBUG: Processing block: {full_block[:120]}...")
+        
+        date_match = date_start_pattern.match(full_block)
+        if not date_match:
+            print(f"    -> No date match")
+            return None
+        
+        date_str = date_match.group(1)
+        
+        # Split the block into parts
+        parts = full_block.split()
+        
+        if len(parts) < 2:
+            print(f"    -> Not enough parts")
+            return None
+        
+        # Find money values from the END
+        # Money values always have decimal points (e.g., "2000.00", "1.25", "49.86")
+        balance = 0.0
+        withdrawal = 0.0
+        deposit = 0.0
+        money_count = 0
+        narration_end_index = len(parts)
+        
+        # Scan from the end to find money values
+        for i in range(len(parts) - 1, 0, -1):
+            if looks_like_money(parts[i]):
+                money_count += 1
+                if money_count == 1:
+                    # Last money value = balance
+                    balance = clean_money(parts[i])
+                    narration_end_index = i
+                elif money_count == 2:
+                    # Second-to-last = could be withdrawal or deposit
+                    amount = clean_money(parts[i])
+                    # Check the narration to determine type
+                    narration_check = " ".join(parts[1:i]).upper()
+                    if 'NACH' in narration_check or 'CHARGES' in narration_check or 'UPI/DR' in narration_check:
+                        withdrawal = amount
+                    else:
+                        # Could be deposit, but check if there's a third value
+                        if i > 1 and looks_like_money(parts[i-1]):
+                            # There's a third money value, so this is withdrawal
+                            withdrawal = amount
+                        else:
+                            # No third value, so this could be deposit or withdrawal
+                            # Default to withdrawal for NACH/charges
+                            if 'NACH' in narration_check or 'CHARGES' in narration_check:
+                                withdrawal = amount
+                            else:
+                                deposit = amount
+                    narration_end_index = i
+                elif money_count == 3:
+                    # Third-to-last = deposit (if format is Deposit, Withdrawal, Balance)
+                    deposit = clean_money(parts[i])
+                    # The second value we found was withdrawal
+                    narration_end_index = i
+                    break
+                
+                if money_count >= 2:
+                    # We have enough, stop looking
+                    break
+        
+        # Extract narration (from after date to before first money value)
+        narration_parts = parts[1:narration_end_index]
+        narration = " ".join(narration_parts).strip()
+        
+        # Remove any remaining reference numbers (8+ digits with no decimal)
+        narration = re.sub(r'\b\d{8,}\b', '', narration).strip()
+        narration = re.sub(r'\s+', ' ', narration).strip()
+        
+        print(f"    -> Date: {date_str}")
+        print(f"    -> Narration: {narration[:60]}...")
+        print(f"    -> Money values found: {money_count}")
+        print(f"    -> W={withdrawal}, D={deposit}, B={balance}")
+        
+        if balance == 0:
+            print(f"    -> Skipping (zero balance)")
+            return None
+        
+        txn_data = {
+            'Date': pd.to_datetime(date_str, format='%d-%m-%Y', errors='coerce'),
+            'Narration': narration,
+            'Withdrawal Amt.': withdrawal,
+            'Deposit Amt.': deposit,
+            'Closing Balance': balance
+        }
+        
+        return txn_data
+
+    # --- State Machine ---
+    current_block_lines = []
+    data_started = False
+    
+    header_pattern = re.compile(r"Date\s+Particulars\s+Deposits\s+Withdrawals\s+Balance", re.IGNORECASE)
+    
     for line in text.split('\n'):
         line = line.strip()
-        if "page " in line or "Date Particulars Deposits" in line or "Opening Balance" in line: continue
-        if not line_start_pattern.match(line) and cleaned_lines:
-            if "--- PAGE BREAK ---" not in line:
-                cleaned_lines[-1] += " " + line
-        else:
-            cleaned_lines.append(line)
-    for line in cleaned_lines:
-        if not line_start_pattern.match(line): continue
-        parts = line.split()
-        if len(parts) < 4: continue
-        try:
-            date_str = parts[0]
-            balance_str = parts[-1]; withdrawals_str = parts[-2]; deposits_str = parts[-3]
-            narration = " ".join(parts[1:-3])
-            transactions.append({'Date': pd.to_datetime(date_str, format='%d-%m-%Y'), 'Narration': narration.strip(), 'Withdrawal Amt.': withdrawals_str, 'Deposit Amt.': deposits_str, 'Closing Balance': balance_str})
-        except (ValueError, IndexError): continue
-    if not transactions: return pd.DataFrame()
+
+        if not data_started:
+            if header_pattern.search(line):
+                data_started = True
+                print("Header found, starting parser.")
+            continue
+        
+        # Skip junk lines
+        if not line or \
+           "--- PAGE BREAK ---" in line or \
+           "Canara Bank" in line or \
+           "page " in line.lower() or \
+           header_pattern.search(line):
+            continue
+        
+        # Check if line starts with date
+        if date_start_pattern.match(line):
+            if current_block_lines:
+                parsed_txn = process_block(current_block_lines)
+                if parsed_txn:
+                    transactions.append(parsed_txn)
+            
+            current_block_lines = [line]
+        
+        elif current_block_lines:
+            current_block_lines.append(line)
+    
+    if current_block_lines:
+        parsed_txn = process_block(current_block_lines)
+        if parsed_txn:
+            transactions.append(parsed_txn)
+        
+    if not transactions:
+        print("--- Parser finished: No transactions were extracted. ---")
+        return pd.DataFrame()
+
+    print(f"--- Parser finished: Extracted {len(transactions)} transactions.")
     df = pd.DataFrame(transactions)
-    money_cols = ['Withdrawal Amt.', 'Deposit Amt.', 'Closing Balance']
-    for col in money_cols:
-        df[col] = df[col].astype(str).str.replace(',', '', regex=False).str.strip()
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    df = df.dropna(subset=['Date'])
     return df
 
 def parse_central_bank_of_india(text: str) -> pd.DataFrame:
@@ -6097,17 +6249,26 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
 
     elif "CANARA" in upper_filename:
         print("Bank identified by filename as: Canara Bank.")
+        
+        # Debug: Show what we're checking
+        print(f"   DEBUG: First 800 chars of upper_text:\n{upper_text[:800]}")
 
         # Internal check for Canara's two formats
-        # We check for the new format's unique header
-        if "Txn Date Value Date" in upper_text:
+        # Format 2 has multiple unique indicators
+        format2_indicators = [
+            "TXN DATE" in upper_text and "VALUE DATE" in upper_text,
+            "CHEQUE NO" in upper_text and "BRANCH CODE" in upper_text,
+            "CURRENT & SAVING ACCOUNT STATEMENT" in upper_text
+        ]
+        
+        if any(format2_indicators):
             print(" -> Using Canara Format 2 (v3 parser).")
             return parse_canara_bank_format2(text)
         else:
             # Fallback to original parser
-            print(" -> Using original Canara parser.")
+            print(" -> Using original Canara parser (Format 1).")
             return parse_canara_bank(text)
-
+            
     elif "EQUITAS" in upper_filename:
         print("Bank identified by filename as: Equitas.")
         return parse_equitas_bank(text)
