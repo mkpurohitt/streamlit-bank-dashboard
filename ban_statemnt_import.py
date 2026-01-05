@@ -5938,6 +5938,34 @@ def parse_bank_statement(filename: str, file_content: bytes) -> pd.DataFrame:
         else:
             print(" -> Using PNB Format 1 (Standard/Original).")
             return parse_punjab_national_bank_v1(text)
+    
+    elif "HDFC" in upper_filename:
+        print("Bank identified by filename as: HDFC.")
+        
+        if "CHQ./REF.NO.VALUEDT" in clean_upper_text:
+            print(" -> Found 'CHQ./REF.NO.VALUEDT'. Using HDFC Format 2 (parse_hdfc_bank_format2).")
+            return parse_hdfc_bank_format2(text) # <--- SWAPPED
+             
+           
+        elif "CHQ./REF.NO." in clean_upper_text:
+            print(" -> Found 'CHQ./REF.NO.' but not 'VALUEDT'. Using HDFC Format 1 (parse_hdfc_bank).")
+            return parse_hdfc_bank(text) # <--- SWAPPED
+             
+        else:
+            
+            print(" -> No known HDFC header found, trying Format 2.")
+            return parse_hdfc_bank_format2(text)
+
+
+    elif "AU" in upper_filename:
+        print("Bank identified by filename as: AU Small Finance Bank.")
+        # Internal check for AU's two formats
+        if "TXNDATEVALUE" in clean_upper_text:
+            print(" -> Using AU Format 2 (v9 parser).")
+            return parse_au_bank_format3(text) # The new parser
+        else:
+            print(" -> Using AU Format 1 (original parser).")
+            return parse_au_bank(text) # Your original parser
 
     elif "YES BANK" in upper_filename:
         print("Bank identified by filename as: YES Bank.")
